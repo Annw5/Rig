@@ -63,6 +63,14 @@ function loadVrmFromFile(file) {
       const names = Object.keys(vrm.expressionManager.expressionMap);
       console.log('Выражения модели:', names);
       exprBox.textContent = 'Выражения модели (' + names.length + '):\n' + names.join(', ');
+      const morphNames = [];
+      vrm.scene.traverse((object) => {
+        if (object.isMesh && object.morphTargetDictionary) {
+          morphNames.push(object.name + ': ' + Object.keys(object.morphTargetDictionary).join(', '));
+        }
+      });
+      console.log('Формы сетки:', morphNames);
+      exprBox.textContent += '\n\nФормы сетки:\n' + morphNames.join('\n');
     },
     undefined,
     (error) => {
