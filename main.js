@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
-import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
+import { FaceLandmarker, PoseLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
 
 // ---------- Сцена, камера, рендерер ----------
 const scene = new THREE.Scene();
@@ -144,14 +144,15 @@ try {
 const RANGE = {
   blink: 0.5,
   pucker: 0.5,
-  smile: 0.5
+  smile: 0.5,
+  brow: 0.5 // NEW
 };
 const DEAD = 0.08;
 
-// NEW: настройки рта (автоподстройка)
+// Настройки рта (автоподстройка)
 const DEAD_JAW = 0.02;
 const JAW_MAX_BASE = 0.03;
-const JAW_MIN_PEAK = 0.12;
+const JAW_MIN_PEAK = 0.08;
 const JAW_DECAY = 0.99;
 let jawPeak = JAW_MIN_PEAK;
 
@@ -164,16 +165,26 @@ const NECK_SHARE = 0.3;
 const HEAD_SMOOTH = 0.4;
 const MAX_ANGLE = { yaw: 1.0, pitch: 0.8, roll: 0.7 };
 
-// NEW: защита от потери лица и "прыжков" углов
+// Защита от потери лица и "прыжков" углов
 const MAX_VALID = { yaw: 1.4, pitch: 1.1, roll: 1.0 };
 const LOST_DELAY = 400;
 const RELAX_SMOOTH = 0.05;
 let lastFaceTime = 0;
 
+// NEW: настройки рук
+const ARM_SIGN = { x: -1, y: -1, z: -1 };
+const POSE_VISIBLE = 0.5;
+const ARM_SMOOTH = 0.3;
+const ARM_REST_OUT = 0.25;
+const POSE_EVERY = 2;
+
 let debugCounter = 0;
 
-// ---------- Камера и трекинг лица ----------
+// ---------- Камера и трекинг ----------
 let faceLandmarker = null;
+let poseLandmarker = null; // NEW
+let latestPose = null; // NEW
+let poseFrame = 0; // NEW
 
 async function startTracking() {
   try {
@@ -203,6 +214,21 @@ async function startTracking() {
     });
 
     cameraButton.textContent = 'Камера включена';
+
+    // NEW: поза тела грузится отдельно, чтобы лицо работало, даже если тело не запустится
+    try {
+      poseLandmarker = await PoseLandmarker.createFromOptions(fileset, {
+        baseOptions: {
+          modelAssetPath:
+            'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+          delegate: 'GPU'
+        },
+        runningMode: 'VIDEO',
+        numPoses: 1
+      });
+    } catch (poseError) {
+      console.error('Не удалось запустить трекинг тела:', poseError);
+    }
   } catch (error) {
     console.error(error);
     alert('Не получилось включить камеру или трекинг. Подробности в консоли (F12).');
@@ -260,7 +286,6 @@ function level(shapes, name, range, dead = DEAD) {
   return Math.max(0, value - dead) / (1 - dead);
 }
 
-// NEW: открытие рта с автоподстройкой
 function jawLevel(shapes) {
   const base = Math.min(neutral.jawOpen ?? 0, JAW_MAX_BASE);
   const value = Math.max(0, (shapes.jawOpen ?? 0) - base);
@@ -277,7 +302,7 @@ const tmpQuaternion = new THREE.Quaternion();
 const tmpScale = new THREE.Vector3();
 const tmpEuler = new THREE.Euler();
 const targetQuaternion = new THREE.Quaternion();
-const identityQuaternion = new THREE.Quaternion(); // NEW
+const identityQuaternion = new THREE.Quaternion();
 
 function limit(value, max) {
   return Math.max(-max, Math.min(max, value));
@@ -310,7 +335,6 @@ function applyHead(shapes) {
   const rawPitch = shapes.headPitch - (neutral.headPitch ?? 0);
   const rawRoll = shapes.headRoll - (neutral.headRoll ?? 0);
 
-  // NEW: слишком большие углы считаем ненадёжными и пропускаем
   if (
     Math.abs(rawYaw) > MAX_VALID.yaw ||
     Math.abs(rawPitch) > MAX_VALID.pitch ||
@@ -329,7 +353,6 @@ function applyHead(shapes) {
   rotateBone(neck, pitch * flip, yaw, roll * flip, NECK_SHARE);
 }
 
-// NEW: плавный возврат головы в центр, когда лицо потеряно
 function relaxHead() {
   const humanoid = currentVrm.humanoid;
   for (const name of ['head', 'neck']) {
@@ -337,6 +360,96 @@ function relaxHead() {
     if (bone) {
       bone.quaternion.slerp(identityQuaternion, RELAX_SMOOTH);
     }
+  }
+}
+
+// ---------- NEW: Руки ----------
+const armRest = new THREE.Vector3();
+const armWant = new THREE.Vector3();
+const upperQ = new THREE.Quaternion();
+const lowerQ = new THREE.Quaternion();
+const upperInverse = new THREE.Quaternion();
+const dirUpper = new THREE.Vector3();
+const dirLower = new THREE.Vector3();
+
+function setDirection(from, to, target) {
+  target.set(
+    (to.x - from.x) * ARM_SIGN.x,
+    (to.y - from.y) * ARM_SIGN.y,
+    (to.z - from.z) * ARM_SIGN.z
+  );
+}
+
+function quaternionFromDirection(side, dir, flip, out) {
+  armRest.set(side * flip, 0, 0);
+  armWant.set(dir.x * flip, dir.y, dir.z * flip);
+  if (armWant.lengthSq() < 0.000001) {
+    out.identity();
+    return;
+  }
+  armWant.normalize();
+  out.setFromUnitVectors(armRest, armWant);
+}
+
+function applyArm(side, shoulderId, elbowId, wristId) {
+  const humanoid = currentVrm.humanoid;
+  const upperBone = humanoid.getNormalizedBoneNode(side === 1 ? 'leftUpperArm' : 'rightUpperArm');
+  const lowerBone = humanoid.getNormalizedBoneNode(side === 1 ? 'leftLowerArm' : 'rightLowerArm');
+  if (!upperBone || !lowerBone) return;
+
+  const flip = currentVrm.meta.metaVersion === '0' ? -1 : 1;
+
+  let upperVisible = false;
+  let lowerVisible = false;
+
+  if (latestPose) {
+    const image = latestPose.image;
+    const world = latestPose.world;
+
+    upperVisible =
+      (image[shoulderId].visibility ?? 0) > POSE_VISIBLE &&
+      (image[elbowId].visibility ?? 0) > POSE_VISIBLE;
+    lowerVisible = upperVisible && (image[wristId].visibility ?? 0) > POSE_VISIBLE;
+
+    if (upperVisible) {
+      setDirection(world[shoulderId], world[elbowId], dirUpper);
+    }
+    if (lowerVisible) {
+      setDirection(world[elbowId], world[wristId], dirLower);
+    }
+  }
+
+  if (!upperVisible) {
+    dirUpper.set(side * ARM_REST_OUT, -1, 0);
+  }
+  if (!lowerVisible) {
+    dirLower.copy(dirUpper);
+  }
+
+  quaternionFromDirection(side, dirUpper, flip, upperQ);
+  quaternionFromDirection(side, dirLower, flip, lowerQ);
+
+  upperInverse.copy(upperQ).invert();
+  lowerQ.premultiply(upperInverse);
+
+  upperBone.quaternion.slerp(upperQ, ARM_SMOOTH);
+  lowerBone.quaternion.slerp(lowerQ, ARM_SMOOTH);
+}
+
+function applyArms() {
+  applyArm(1, 12, 14, 16);
+  applyArm(-1, 11, 13, 15);
+}
+
+function updatePose() {
+  poseFrame++;
+  if (poseFrame % POSE_EVERY !== 0) return;
+
+  const result = poseLandmarker.detectForVideo(video, performance.now());
+  if (result.landmarks.length > 0 && result.worldLandmarks.length > 0) {
+    latestPose = { image: result.landmarks[0], world: result.worldLandmarks[0] };
+  } else {
+    latestPose = null;
   }
 }
 
@@ -375,13 +488,15 @@ function applyFace(result) {
     const names = [
       'eyeBlinkLeft', 'eyeBlinkRight', 'jawOpen',
       'mouthPucker', 'mouthSmileLeft', 'mouthSmileRight',
+      'browInnerUp', 'browDownLeft', 'browOuterUpLeft',
       'headYaw', 'headPitch', 'headRoll'
     ];
     debugBox.textContent =
       names
         .map((n) => n + ': сейчас ' + (shapes[n] ?? 0).toFixed(2) + ', покой ' + (neutral[n] ?? 0).toFixed(2))
         .join('\n') +
-      '\nпик рта: ' + jawPeak.toFixed(2);
+      '\nпик рта: ' + jawPeak.toFixed(2) +
+      '\nтело: ' + (latestPose ? 'видно' : 'не видно');
   }
 
   setSmooth('blinkLeft', level(shapes, 'eyeBlinkLeft', RANGE.blink));
@@ -393,6 +508,19 @@ function applyFace(result) {
     (level(shapes, 'mouthSmileLeft', RANGE.smile) +
       level(shapes, 'mouthSmileRight', RANGE.smile)) / 2;
   setMorphSmooth('Fcl_MTH_Joy', smile);
+
+  // NEW: брови
+  const browUp =
+    (level(shapes, 'browOuterUpLeft', RANGE.brow) +
+      level(shapes, 'browOuterUpRight', RANGE.brow)) / 2;
+  const browDown =
+    (level(shapes, 'browDownLeft', RANGE.brow) +
+      level(shapes, 'browDownRight', RANGE.brow)) / 2;
+  const browInner = level(shapes, 'browInnerUp', RANGE.brow);
+
+  setMorphSmooth('Fcl_BRW_Surprised', browUp);
+  setMorphSmooth('Fcl_BRW_Angry', browDown);
+  setMorphSmooth('Fcl_BRW_Sorrow', browInner);
 
   if (headAngles) {
     applyHead(shapes);
@@ -409,19 +537,24 @@ function animate() {
 
   if (faceLandmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
     lastVideoTime = video.currentTime;
+
     const result = faceLandmarker.detectForVideo(video, performance.now());
     if (currentVrm && result.faceBlendshapes.length > 0) {
-      lastFaceTime = performance.now(); // NEW
+      lastFaceTime = performance.now();
       applyFace(result);
+    }
+
+    if (poseLandmarker) {
+      updatePose(); // NEW
     }
   }
 
-  // NEW: если лица давно нет, голова возвращается в центр
   if (currentVrm && faceLandmarker && performance.now() - lastFaceTime > LOST_DELAY) {
     relaxHead();
   }
 
   if (currentVrm) {
+    applyArms(); // NEW
     currentVrm.update(delta);
   }
 
