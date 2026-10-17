@@ -40,6 +40,7 @@ const loader = new GLTFLoader();
 loader.register((parser) => new VRMLoaderPlugin(parser));
 
 let currentVrm = null;
+let faceMeshes = []; // NEW
 
 function loadVrmFromFile(file) {
   const url = URL.createObjectURL(file);
@@ -61,16 +62,20 @@ function loadVrmFromFile(file) {
       URL.revokeObjectURL(url);
 
       const names = Object.keys(vrm.expressionManager.expressionMap);
-      console.log('Выражения модели:', names);
       exprBox.textContent = 'Выражения модели (' + names.length + '):\n' + names.join(', ');
-      const morphNames = [];
+
+      // NEW: собираем все куски лица, у которых есть нужные формы
+      faceMeshes = [];
       vrm.scene.traverse((object) => {
-        if (object.isMesh && object.morphTargetDictionary) {
-          morphNames.push(object.name + ': ' + Object.keys(object.morphTargetDictionary).join(', '));
+        if (
+          object.isMesh &&
+          object.morphTargetDictionary &&
+          object.morphTargetDictionary['Fcl_MTH_Joy'] !== undefined
+        ) {
+          faceMeshes.push(object);
         }
       });
-      console.log('Формы сетки:', morphNames);
-      exprBox.textContent += '\n\nФормы сетки:\n' + morphNames.join('\n');
+      console.log('Кусков лица с формами:', faceMeshes.length);
     },
     undefined,
     (error) => {
@@ -88,7 +93,6 @@ fileInput.addEventListener('change', (event) => {
 });
 
 // ---------- Настройки ----------
-
 let neutral = {};
 let calibration = null;
 
@@ -100,12 +104,12 @@ try {
 
 const RANGE = {
   blink: 0.5,
-  jaw: 0.4,
+  jaw: 0.2,
   pucker: 0.5,
   smile: 0.5
 };
-const HAPPY_MAX = 0.5;
 const DEAD = 0.08;
+const DEAD_JAW = 0.02; // NEW
 
 let debugCounter = 0;
 
@@ -158,17 +162,13 @@ calibrateButton.addEventListener('click', () => {
 });
 
 resetButton.addEventListener('click', () => {
-  neutral = { };
+  neutral = {};
   localStorage.removeItem('neutral');
 });
 
 // ---------- Помощники ----------
 function clamp01(value) {
   return Math.min(1, Math.max(0, value));
-}
-
-function hasExpression(name) {
-  return currentVrm.expressionManager.getExpression(name) != null;
 }
 
 function setSmooth(name, target) {
@@ -178,10 +178,27 @@ function setSmooth(name, target) {
   expressions.setValue(name, next);
 }
 
-function level(shapes, name, range) {
+// NEW: то же самое, но для отдельной формы сетки, на всех кусках лица
+function setMorphSmooth(name, target) {
+  if (faceMeshes.length === 0) return;
+
+  const first = faceMeshes[0];
+  const firstIndex = first.morphTargetDictionary[name];
+  const current = first.morphTargetInfluences[firstIndex] ?? 0;
+  const next = current + (clamp01(target) - current) * 0.5;
+
+  for (const mesh of faceMeshes) {
+    const index = mesh.morphTargetDictionary[name];
+    if (index !== undefined) {
+      mesh.morphTargetInfluences[index] = next;
+    }
+  }
+}
+
+function level(shapes, name, range, dead = DEAD) {
   const base = neutral[name] ?? 0;
   const value = (shapes[name] - base) / range;
-  return Math.max(0, value - DEAD) / (1 - DEAD);
+  return Math.max(0, value - dead) / (1 - dead);
 }
 
 // ---------- Применяем лицо к модели ----------
@@ -220,18 +237,14 @@ function applyFace(result) {
 
   setSmooth('blinkLeft', level(shapes, 'eyeBlinkLeft', RANGE.blink));
   setSmooth('blinkRight', level(shapes, 'eyeBlinkRight', RANGE.blink));
-  setSmooth('aa', level(shapes, 'jawOpen', RANGE.jaw));
+  setSmooth('aa', level(shapes, 'jawOpen', RANGE.jaw, DEAD_JAW));
   setSmooth('ou', level(shapes, 'mouthPucker', RANGE.pucker));
 
-  const smileLeft = level(shapes, 'mouthSmileLeft', RANGE.smile);
-  const smileRight = level(shapes, 'mouthSmileRight', RANGE.smile);
-
-  if (hasExpression('mouthSmileLeft') && hasExpression('mouthSmileRight')) {
-    setSmooth('mouthSmileLeft', smileLeft);
-    setSmooth('mouthSmileRight', smileRight);
-  } else {
-    setSmooth('happy', ((smileLeft + smileRight) / 2) * HAPPY_MAX);
-  }
+  // NEW: улыбка только ртом, без прищура глаз
+  const smile =
+    (level(shapes, 'mouthSmileLeft', RANGE.smile) +
+      level(shapes, 'mouthSmileRight', RANGE.smile)) / 2;
+  setMorphSmooth('Fcl_MTH_Joy', smile);
 }
 
 // ---------- Главный цикл ----------
