@@ -68,7 +68,7 @@ fileInput.addEventListener('change', (event) => {
   }
 });
 
-// ---------- NEW: Камера и трекинг лица ----------
+// ---------- Камера и трекинг лица ----------
 const video = document.getElementById('video');
 const cameraButton = document.getElementById('cameraButton');
 
@@ -111,7 +111,25 @@ async function startTracking() {
 
 cameraButton.addEventListener('click', startTracking);
 
-// ---------- NEW: Помощники ----------
+// ---------- Калибровка и настройки ----------
+let neutral = {};
+let calibration = null;
+
+try {
+  neutral = JSON.parse(localStorage.getItem('neutral')) ?? {};
+} catch (error) {
+  neutral = {};
+}
+
+const RANGE = {
+  blink: 0.5,
+  jaw: 0.4,
+  pucker: 0.5,
+  smile: 0.5
+};
+const HAPPY_MAX = 0.5;
+
+// ---------- Помощники ----------
 function clamp01(value) {
   return Math.min(1, Math.max(0, value));
 }
@@ -123,7 +141,46 @@ function setSmooth(name, target) {
   expressions.setValue(name, next);
 }
 
-// ---------- NEW: Применяем лицо к модели ----------
+function level(shapes, name, range) {
+  const base = neutral[name] ?? 0;
+  return (shapes[name] - base) / range;
+}
+
+// ---------- Применяем лицо к модели ----------
+function applyFace(result) {
+  const shapes = {};
+  for (const item of result.faceBlendshapes[0].categories) {
+    shapes[item.categoryName] = item.score;
+  }
+
+  if (calibration) {
+    for (const name in shapes) {
+      calibration.sums[name] = (calibration.sums[name] ?? 0) + shapes[name];
+    }
+    calibration.count++;
+
+    if (performance.now() > calibration.endTime) {
+      for (const name in calibration.sums) {
+        neutral[name] = calibration.sums[name] / calibration.count;
+      }
+      localStorage.setItem('neutral', JSON.stringify(neutral));
+      calibration = null;
+      calibrateButton.textContent = 'Калибровка';
+    }
+  }
+
+  setSmooth('blinkLeft', level(shapes, 'eyeBlinkLeft', RANGE.blink));
+  setSmooth('blinkRight', level(shapes, 'eyeBlinkRight', RANGE.blink));
+  setSmooth('aa', level(shapes, 'jawOpen', RANGE.jaw));
+  setSmooth('ou', level(shapes, 'mouthPucker', RANGE.pucker));
+
+  const smile =
+    (level(shapes, 'mouthSmileLeft', RANGE.smile) +
+      level(shapes, 'mouthSmileRight', RANGE.smile)) / 2;
+  setSmooth('happy', smile * HAPPY_MAX);
+}
+
+// ---------- Применяем лицо к модели ----------
 function applyFace(result) {
   const shapes = {};
   for (const item of result.faceBlendshapes[0].categories) {
