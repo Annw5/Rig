@@ -143,14 +143,19 @@ try {
 
 const RANGE = {
   blink: 0.5,
-  jaw: 0.2,
   pucker: 0.5,
   smile: 0.5
 };
 const DEAD = 0.08;
-const DEAD_JAW = 0.02;
 
-// NEW: настройки головы
+// NEW: настройки рта (автоподстройка)
+const DEAD_JAW = 0.02;
+const JAW_MAX_BASE = 0.03;
+const JAW_MIN_PEAK = 0.08;
+const JAW_DECAY = 0.99;
+let jawPeak = JAW_MIN_PEAK;
+
+// Настройки головы
 const YAW_SIGN = -1;
 const PITCH_SIGN = 1;
 const ROLL_SIGN = -1;
@@ -158,6 +163,12 @@ const HEAD_SHARE = 0.7;
 const NECK_SHARE = 0.3;
 const HEAD_SMOOTH = 0.4;
 const MAX_ANGLE = { yaw: 1.0, pitch: 0.8, roll: 0.7 };
+
+// NEW: защита от потери лица и "прыжков" углов
+const MAX_VALID = { yaw: 1.4, pitch: 1.1, roll: 1.0 };
+const LOST_DELAY = 400;
+const RELAX_SMOOTH = 0.05;
+let lastFaceTime = 0;
 
 let debugCounter = 0;
 
@@ -188,7 +199,7 @@ async function startTracking() {
       runningMode: 'VIDEO',
       numFaces: 1,
       outputFaceBlendshapes: true,
-      outputFacialTransformationMatrixes: true // NEW
+      outputFacialTransformationMatrixes: true
     });
 
     cameraButton.textContent = 'Камера включена';
@@ -249,13 +260,24 @@ function level(shapes, name, range, dead = DEAD) {
   return Math.max(0, value - dead) / (1 - dead);
 }
 
-// ---------- NEW: Голова ----------
+// NEW: открытие рта с автоподстройкой
+function jawLevel(shapes) {
+  const base = Math.min(neutral.jawOpen ?? 0, JAW_MAX_BASE);
+  const value = Math.max(0, (shapes.jawOpen ?? 0) - base);
+
+  jawPeak = Math.max(value, jawPeak * JAW_DECAY, JAW_MIN_PEAK);
+
+  return clamp01((value - DEAD_JAW) / (jawPeak - DEAD_JAW));
+}
+
+// ---------- Голова ----------
 const tmpMatrix = new THREE.Matrix4();
 const tmpPosition = new THREE.Vector3();
 const tmpQuaternion = new THREE.Quaternion();
 const tmpScale = new THREE.Vector3();
 const tmpEuler = new THREE.Euler();
 const targetQuaternion = new THREE.Quaternion();
+const identityQuaternion = new THREE.Quaternion(); // NEW
 
 function limit(value, max) {
   return Math.max(-max, Math.min(max, value));
@@ -284,14 +306,38 @@ function applyHead(shapes) {
   const head = humanoid.getNormalizedBoneNode('head');
   const neck = humanoid.getNormalizedBoneNode('neck');
 
-  const yaw = limit((shapes.headYaw - (neutral.headYaw ?? 0)) * YAW_SIGN, MAX_ANGLE.yaw);
-  const pitch = limit((shapes.headPitch - (neutral.headPitch ?? 0)) * PITCH_SIGN, MAX_ANGLE.pitch);
-  const roll = limit((shapes.headRoll - (neutral.headRoll ?? 0)) * ROLL_SIGN, MAX_ANGLE.roll);
+  const rawYaw = shapes.headYaw - (neutral.headYaw ?? 0);
+  const rawPitch = shapes.headPitch - (neutral.headPitch ?? 0);
+  const rawRoll = shapes.headRoll - (neutral.headRoll ?? 0);
+
+  // NEW: слишком большие углы считаем ненадёжными и пропускаем
+  if (
+    Math.abs(rawYaw) > MAX_VALID.yaw ||
+    Math.abs(rawPitch) > MAX_VALID.pitch ||
+    Math.abs(rawRoll) > MAX_VALID.roll
+  ) {
+    return;
+  }
+
+  const yaw = limit(rawYaw * YAW_SIGN, MAX_ANGLE.yaw);
+  const pitch = limit(rawPitch * PITCH_SIGN, MAX_ANGLE.pitch);
+  const roll = limit(rawRoll * ROLL_SIGN, MAX_ANGLE.roll);
 
   const flip = currentVrm.meta.metaVersion === '0' ? -1 : 1;
 
   rotateBone(head, pitch * flip, yaw, roll * flip, HEAD_SHARE);
   rotateBone(neck, pitch * flip, yaw, roll * flip, NECK_SHARE);
+}
+
+// NEW: плавный возврат головы в центр, когда лицо потеряно
+function relaxHead() {
+  const humanoid = currentVrm.humanoid;
+  for (const name of ['head', 'neck']) {
+    const bone = humanoid.getNormalizedBoneNode(name);
+    if (bone) {
+      bone.quaternion.slerp(identityQuaternion, RELAX_SMOOTH);
+    }
+  }
 }
 
 // ---------- Применяем лицо к модели ----------
@@ -301,7 +347,6 @@ function applyFace(result) {
     shapes[item.categoryName] = item.score;
   }
 
-  // NEW: добавляем углы головы к остальным числам
   const headAngles = getHeadAngles(result);
   if (headAngles) {
     shapes.headYaw = headAngles.yaw;
@@ -332,14 +377,16 @@ function applyFace(result) {
       'mouthPucker', 'mouthSmileLeft', 'mouthSmileRight',
       'headYaw', 'headPitch', 'headRoll'
     ];
-    debugBox.textContent = names
-      .map((n) => n + ': сейчас ' + (shapes[n] ?? 0).toFixed(2) + ', покой ' + (neutral[n] ?? 0).toFixed(2))
-      .join('\n');
+    debugBox.textContent =
+      names
+        .map((n) => n + ': сейчас ' + (shapes[n] ?? 0).toFixed(2) + ', покой ' + (neutral[n] ?? 0).toFixed(2))
+        .join('\n') +
+      '\nпик рта: ' + jawPeak.toFixed(2);
   }
 
   setSmooth('blinkLeft', level(shapes, 'eyeBlinkLeft', RANGE.blink));
   setSmooth('blinkRight', level(shapes, 'eyeBlinkRight', RANGE.blink));
-  setSmooth('aa', level(shapes, 'jawOpen', RANGE.jaw, DEAD_JAW));
+  setSmooth('aa', jawLevel(shapes));
   setSmooth('ou', level(shapes, 'mouthPucker', RANGE.pucker));
 
   const smile =
@@ -364,8 +411,14 @@ function animate() {
     lastVideoTime = video.currentTime;
     const result = faceLandmarker.detectForVideo(video, performance.now());
     if (currentVrm && result.faceBlendshapes.length > 0) {
+      lastFaceTime = performance.now(); // NEW
       applyFace(result);
     }
+  }
+
+  // NEW: если лица давно нет, голова возвращается в центр
+  if (currentVrm && faceLandmarker && performance.now() - lastFaceTime > LOST_DELAY) {
+    relaxHead();
   }
 
   if (currentVrm) {
