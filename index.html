@@ -9,6 +9,7 @@
     #panel { position: fixed; top: 10px; left: 10px; z-index: 10; color: white; }
     canvas { display: block; }
     #video { display: block; width: 220px; margin-top: 10px; transform: scaleX(-1); border-radius: 8px; }
+    #debug { font-size: 12px; margin-top: 8px; background: rgba(0,0,0,0.5); padding: 6px; border-radius: 6px; }
   </style>
 
   <script type="importmap">
@@ -29,6 +30,8 @@
     <br><br>
     <button id="cameraButton">Включить камеру</button>
     <button id="calibrateButton">Калибровка</button>
+    <button id="resetButton">Сброс</button>
+    <pre id="debug"></pre>
     <video id="video" autoplay playsinline muted></video>
   </div>
 
