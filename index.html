@@ -8,6 +8,7 @@
     body { margin: 0; overflow: hidden; background: #222; font-family: sans-serif; }
     #panel { position: fixed; top: 10px; left: 10px; z-index: 10; color: white; }
     canvas { display: block; }
+    #video { display: block; width: 220px; margin-top: 10px; transform: scaleX(-1); border-radius: 8px; }
   </style>
 
   <script type="importmap">
@@ -15,7 +16,8 @@
     "imports": {
       "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
       "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
-      "@pixiv/three-vrm": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.0.0/lib/three-vrm.module.min.js"
+      "@pixiv/three-vrm": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.0.0/lib/three-vrm.module.min.js",
+      "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm"
     }
   }
   </script>
@@ -24,6 +26,9 @@
 <body>
   <div id="panel">
     <input type="file" id="fileInput" accept=".vrm">
+    <br><br>
+    <button id="cameraButton">Включить камеру</button>
+    <video id="video" autoplay playsinline muted></video>
   </div>
 
   <script type="module" src="main.js"></script>
