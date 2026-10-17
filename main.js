@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
-import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision'; // NEW
+import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
 
 // ---------- Сцена, камера, рендерер ----------
 const scene = new THREE.Scene();
@@ -68,10 +68,35 @@ fileInput.addEventListener('change', (event) => {
   }
 });
 
-// ---------- Камера и трекинг лица ----------
+// ---------- Калибровка и настройки ----------
+let neutral = {};
+let calibration = null;
+
+try {
+  neutral = JSON.parse(localStorage.getItem('neutral')) ?? {};
+} catch (error) {
+  neutral = {};
+}
+
+const RANGE = {
+  blink: 0.5,
+  jaw: 0.4,
+  pucker: 0.5,
+  smile: 0.5
+};
+const HAPPY_MAX = 0.5;
+const DEAD = 0.08;
+
+const debugBox = document.getElementById('debug');
+let debugCounter = 0;
+
+// ---------- Кнопки ----------
 const video = document.getElementById('video');
 const cameraButton = document.getElementById('cameraButton');
+const calibrateButton = document.getElementById('calibrateButton');
+const resetButton = document.getElementById('resetButton');
 
+// ---------- Камера и трекинг лица ----------
 let faceLandmarker = null;
 
 async function startTracking() {
@@ -110,33 +135,19 @@ async function startTracking() {
 }
 
 cameraButton.addEventListener('click', startTracking);
-const resetButton = document.getElementById('resetButton');
+
+calibrateButton.addEventListener('click', () => {
+  calibrateButton.textContent = 'Расслабь лицо...';
+  setTimeout(() => {
+    calibration = { endTime: performance.now() + 2000, sums: {}, count: 0 };
+    calibrateButton.textContent = 'Идёт замер...';
+  }, 2000);
+});
 
 resetButton.addEventListener('click', () => {
   neutral = {};
   localStorage.removeItem('neutral');
 });
-
-// ---------- Калибровка и настройки ----------
-let neutral = {};
-let calibration = null;
-
-try {
-  neutral = JSON.parse(localStorage.getItem('neutral')) ?? {};
-} catch (error) {
-  neutral = {};
-}
-
-const RANGE = {
-  blink: 0.5,
-  jaw: 0.4,
-  pucker: 0.5,
-  smile: 0.5
-};
-const HAPPY_MAX = 0.5;
-const DEAD = 0.08;
-const debugBox = document.getElementById('debug');
-let debugCounter = 0;
 
 // ---------- Помощники ----------
 function clamp01(value) {
@@ -178,16 +189,18 @@ function applyFace(result) {
       calibrateButton.textContent = 'Калибровка';
     }
   }
-debugCounter++;
-if (debugCounter % 10 === 0) {
-  const names = [
-    'eyeBlinkLeft', 'eyeBlinkRight', 'jawOpen',
-    'mouthPucker', 'mouthSmileLeft', 'mouthSmileRight'
-  ];
-  debugBox.textContent = names
-    .map((n) => n + ': сейчас ' + shapes[n].toFixed(2) + ', покой ' + (neutral[n] ?? 0).toFixed(2))
-    .join('\n');
-}
+
+  debugCounter++;
+  if (debugCounter % 10 === 0) {
+    const names = [
+      'eyeBlinkLeft', 'eyeBlinkRight', 'jawOpen',
+      'mouthPucker', 'mouthSmileLeft', 'mouthSmileRight'
+    ];
+    debugBox.textContent = names
+      .map((n) => n + ': сейчас ' + shapes[n].toFixed(2) + ', покой ' + (neutral[n] ?? 0).toFixed(2))
+      .join('\n');
+  }
+
   setSmooth('blinkLeft', level(shapes, 'eyeBlinkLeft', RANGE.blink));
   setSmooth('blinkRight', level(shapes, 'eyeBlinkRight', RANGE.blink));
   setSmooth('aa', level(shapes, 'jawOpen', RANGE.jaw));
@@ -201,13 +214,12 @@ if (debugCounter % 10 === 0) {
 
 // ---------- Главный цикл ----------
 const clock = new THREE.Clock();
-let lastVideoTime = -1; // NEW
+let lastVideoTime = -1;
 
 function animate() {
   requestAnimationFrame(animate);
   const delta = clock.getDelta();
 
-  //  трекинг
   if (faceLandmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
     lastVideoTime = video.currentTime;
     const result = faceLandmarker.detectForVideo(video, performance.now());
