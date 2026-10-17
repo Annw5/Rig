@@ -151,7 +151,7 @@ const DEAD = 0.08;
 // NEW: настройки рта (автоподстройка)
 const DEAD_JAW = 0.02;
 const JAW_MAX_BASE = 0.03;
-const JAW_MIN_PEAK = 0.08;
+const JAW_MIN_PEAK = 0.12;
 const JAW_DECAY = 0.99;
 let jawPeak = JAW_MIN_PEAK;
 
