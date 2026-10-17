@@ -26,6 +26,15 @@ light.position.set(1, 1, 1);
 scene.add(light);
 scene.add(new THREE.AmbientLight(0xffffff, 0.8));
 
+// ---------- Элементы страницы ----------
+const fileInput = document.getElementById('fileInput');
+const video = document.getElementById('video');
+const cameraButton = document.getElementById('cameraButton');
+const calibrateButton = document.getElementById('calibrateButton');
+const resetButton = document.getElementById('resetButton');
+const debugBox = document.getElementById('debug');
+const exprBox = document.getElementById('exprBox');
+
 // ---------- Загрузчик VRM ----------
 const loader = new GLTFLoader();
 loader.register((parser) => new VRMLoaderPlugin(parser));
@@ -50,6 +59,10 @@ function loadVrmFromFile(file) {
       currentVrm = vrm;
       scene.add(vrm.scene);
       URL.revokeObjectURL(url);
+
+      const names = Object.keys(vrm.expressionManager.expressionMap);
+      console.log('Выражения модели:', names);
+      exprBox.textContent = 'Выражения модели (' + names.length + '):\n' + names.join(', ');
     },
     undefined,
     (error) => {
@@ -59,8 +72,6 @@ function loadVrmFromFile(file) {
   );
 }
 
-const fileInput = document.getElementById('fileInput');
-
 fileInput.addEventListener('change', (event) => {
   const file = event.target.files[0];
   if (file) {
@@ -68,14 +79,20 @@ fileInput.addEventListener('change', (event) => {
   }
 });
 
-// ---------- Калибровка и настройки ----------
-let neutral = {};
+// ---------- Настройки ----------
+const REST = {
+  eyeBlinkLeft: 0.14,
+  eyeBlinkRight: 0.10
+};
+
+let neutral = { ...REST };
 let calibration = null;
 
 try {
-  neutral = JSON.parse(localStorage.getItem('neutral')) ?? {};
+  const saved = JSON.parse(localStorage.getItem('neutral')) ?? {};
+  neutral = { ...saved, ...REST };
 } catch (error) {
-  neutral = {};
+  neutral = { ...REST };
 }
 
 const RANGE = {
@@ -87,14 +104,7 @@ const RANGE = {
 const HAPPY_MAX = 0.5;
 const DEAD = 0.08;
 
-const debugBox = document.getElementById('debug');
 let debugCounter = 0;
-
-// ---------- Кнопки ----------
-const video = document.getElementById('video');
-const cameraButton = document.getElementById('cameraButton');
-const calibrateButton = document.getElementById('calibrateButton');
-const resetButton = document.getElementById('resetButton');
 
 // ---------- Камера и трекинг лица ----------
 let faceLandmarker = null;
@@ -145,13 +155,17 @@ calibrateButton.addEventListener('click', () => {
 });
 
 resetButton.addEventListener('click', () => {
-  neutral = {};
+  neutral = { ...REST };
   localStorage.removeItem('neutral');
 });
 
 // ---------- Помощники ----------
 function clamp01(value) {
   return Math.min(1, Math.max(0, value));
+}
+
+function hasExpression(name) {
+  return currentVrm.expressionManager.getExpression(name) != null;
 }
 
 function setSmooth(name, target) {
@@ -184,6 +198,7 @@ function applyFace(result) {
       for (const name in calibration.sums) {
         neutral[name] = calibration.sums[name] / calibration.count;
       }
+      Object.assign(neutral, REST);
       localStorage.setItem('neutral', JSON.stringify(neutral));
       calibration = null;
       calibrateButton.textContent = 'Калибровка';
@@ -206,10 +221,15 @@ function applyFace(result) {
   setSmooth('aa', level(shapes, 'jawOpen', RANGE.jaw));
   setSmooth('ou', level(shapes, 'mouthPucker', RANGE.pucker));
 
-  const smile =
-    (level(shapes, 'mouthSmileLeft', RANGE.smile) +
-      level(shapes, 'mouthSmileRight', RANGE.smile)) / 2;
-  setSmooth('happy', smile * HAPPY_MAX);
+  const smileLeft = level(shapes, 'mouthSmileLeft', RANGE.smile);
+  const smileRight = level(shapes, 'mouthSmileRight', RANGE.smile);
+
+  if (hasExpression('mouthSmileLeft') && hasExpression('mouthSmileRight')) {
+    setSmooth('mouthSmileLeft', smileLeft);
+    setSmooth('mouthSmileRight', smileRight);
+  } else {
+    setSmooth('happy', ((smileLeft + smileRight) / 2) * HAPPY_MAX);
+  }
 }
 
 // ---------- Главный цикл ----------
