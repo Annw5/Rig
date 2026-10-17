@@ -79,7 +79,7 @@ const loader = new GLTFLoader();
 loader.register((parser) => new VRMLoaderPlugin(parser));
 
 let currentVrm = null;
-let faceMeshes = []; 
+let faceMeshes = [];
 
 function loadVrmFromFile(file) {
   const url = URL.createObjectURL(file);
@@ -103,7 +103,6 @@ function loadVrmFromFile(file) {
       const names = Object.keys(vrm.expressionManager.expressionMap);
       exprBox.textContent = 'Выражения модели (' + names.length + '):\n' + names.join(', ');
 
-      //  собираем все куски лица, у которых есть нужные формы
       faceMeshes = [];
       vrm.scene.traverse((object) => {
         if (
@@ -115,6 +114,7 @@ function loadVrmFromFile(file) {
         }
       });
       console.log('Кусков лица с формами:', faceMeshes.length);
+      console.log('Версия VRM:', vrm.meta.metaVersion);
     },
     undefined,
     (error) => {
@@ -148,7 +148,16 @@ const RANGE = {
   smile: 0.5
 };
 const DEAD = 0.08;
-const DEAD_JAW = 0.02; 
+const DEAD_JAW = 0.02;
+
+// NEW: настройки головы
+const YAW_SIGN = -1;
+const PITCH_SIGN = 1;
+const ROLL_SIGN = -1;
+const HEAD_SHARE = 0.7;
+const NECK_SHARE = 0.3;
+const HEAD_SMOOTH = 0.4;
+const MAX_ANGLE = { yaw: 1.0, pitch: 0.8, roll: 0.7 };
 
 let debugCounter = 0;
 
@@ -178,7 +187,8 @@ async function startTracking() {
       },
       runningMode: 'VIDEO',
       numFaces: 1,
-      outputFaceBlendshapes: true
+      outputFaceBlendshapes: true,
+      outputFacialTransformationMatrixes: true // NEW
     });
 
     cameraButton.textContent = 'Камера включена';
@@ -217,7 +227,6 @@ function setSmooth(name, target) {
   expressions.setValue(name, next);
 }
 
-//  то же самое, но для отдельной формы сетки, на всех кусках лица
 function setMorphSmooth(name, target) {
   if (faceMeshes.length === 0) return;
 
@@ -240,11 +249,64 @@ function level(shapes, name, range, dead = DEAD) {
   return Math.max(0, value - dead) / (1 - dead);
 }
 
+// ---------- NEW: Голова ----------
+const tmpMatrix = new THREE.Matrix4();
+const tmpPosition = new THREE.Vector3();
+const tmpQuaternion = new THREE.Quaternion();
+const tmpScale = new THREE.Vector3();
+const tmpEuler = new THREE.Euler();
+const targetQuaternion = new THREE.Quaternion();
+
+function limit(value, max) {
+  return Math.max(-max, Math.min(max, value));
+}
+
+function getHeadAngles(result) {
+  const matrix = result.facialTransformationMatrixes?.[0];
+  if (!matrix) return null;
+
+  tmpMatrix.fromArray(matrix.data);
+  tmpMatrix.decompose(tmpPosition, tmpQuaternion, tmpScale);
+  tmpEuler.setFromQuaternion(tmpQuaternion, 'YXZ');
+
+  return { yaw: tmpEuler.y, pitch: tmpEuler.x, roll: tmpEuler.z };
+}
+
+function rotateBone(bone, x, y, z, share) {
+  if (!bone) return;
+  tmpEuler.set(x * share, y * share, z * share, 'YXZ');
+  targetQuaternion.setFromEuler(tmpEuler);
+  bone.quaternion.slerp(targetQuaternion, HEAD_SMOOTH);
+}
+
+function applyHead(shapes) {
+  const humanoid = currentVrm.humanoid;
+  const head = humanoid.getNormalizedBoneNode('head');
+  const neck = humanoid.getNormalizedBoneNode('neck');
+
+  const yaw = limit((shapes.headYaw - (neutral.headYaw ?? 0)) * YAW_SIGN, MAX_ANGLE.yaw);
+  const pitch = limit((shapes.headPitch - (neutral.headPitch ?? 0)) * PITCH_SIGN, MAX_ANGLE.pitch);
+  const roll = limit((shapes.headRoll - (neutral.headRoll ?? 0)) * ROLL_SIGN, MAX_ANGLE.roll);
+
+  const flip = currentVrm.meta.metaVersion === '0' ? -1 : 1;
+
+  rotateBone(head, pitch * flip, yaw, roll * flip, HEAD_SHARE);
+  rotateBone(neck, pitch * flip, yaw, roll * flip, NECK_SHARE);
+}
+
 // ---------- Применяем лицо к модели ----------
 function applyFace(result) {
   const shapes = {};
   for (const item of result.faceBlendshapes[0].categories) {
     shapes[item.categoryName] = item.score;
+  }
+
+  // NEW: добавляем углы головы к остальным числам
+  const headAngles = getHeadAngles(result);
+  if (headAngles) {
+    shapes.headYaw = headAngles.yaw;
+    shapes.headPitch = headAngles.pitch;
+    shapes.headRoll = headAngles.roll;
   }
 
   if (calibration) {
@@ -267,10 +329,11 @@ function applyFace(result) {
   if (debugCounter % 10 === 0) {
     const names = [
       'eyeBlinkLeft', 'eyeBlinkRight', 'jawOpen',
-      'mouthPucker', 'mouthSmileLeft', 'mouthSmileRight'
+      'mouthPucker', 'mouthSmileLeft', 'mouthSmileRight',
+      'headYaw', 'headPitch', 'headRoll'
     ];
     debugBox.textContent = names
-      .map((n) => n + ': сейчас ' + shapes[n].toFixed(2) + ', покой ' + (neutral[n] ?? 0).toFixed(2))
+      .map((n) => n + ': сейчас ' + (shapes[n] ?? 0).toFixed(2) + ', покой ' + (neutral[n] ?? 0).toFixed(2))
       .join('\n');
   }
 
@@ -279,11 +342,14 @@ function applyFace(result) {
   setSmooth('aa', level(shapes, 'jawOpen', RANGE.jaw, DEAD_JAW));
   setSmooth('ou', level(shapes, 'mouthPucker', RANGE.pucker));
 
-  //  улыбка только ртом, без прищура глаз
   const smile =
     (level(shapes, 'mouthSmileLeft', RANGE.smile) +
       level(shapes, 'mouthSmileRight', RANGE.smile)) / 2;
   setMorphSmooth('Fcl_MTH_Joy', smile);
+
+  if (headAngles) {
+    applyHead(shapes);
+  }
 }
 
 // ---------- Главный цикл ----------
