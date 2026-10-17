@@ -15,7 +15,7 @@ const camera = new THREE.PerspectiveCamera(
 );
 camera.position.set(0, 0.85, 4.2);
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(window.devicePixelRatio);
 document.body.appendChild(renderer.domElement);
@@ -34,13 +34,52 @@ const calibrateButton = document.getElementById('calibrateButton');
 const resetButton = document.getElementById('resetButton');
 const debugBox = document.getElementById('debug');
 const exprBox = document.getElementById('exprBox');
+const bgButton = document.getElementById('bgButton');
+const panel = document.getElementById('panel');
+
+// ---------- Фон ----------
+const BG_MODES = ['dark', 'green', 'transparent'];
+const BG_NAMES = { dark: 'тёмный', green: 'зелёный', transparent: 'прозрачный' };
+
+let bgMode = localStorage.getItem('bgMode') ?? 'dark';
+if (!BG_MODES.includes(bgMode)) {
+  bgMode = 'dark';
+}
+
+function applyBackground() {
+  if (bgMode === 'green') {
+    scene.background = new THREE.Color(0x00ff00);
+    document.body.style.background = '#00ff00';
+  } else if (bgMode === 'transparent') {
+    scene.background = null;
+    document.body.style.background = 'transparent';
+  } else {
+    scene.background = new THREE.Color(0x222222);
+    document.body.style.background = '#222';
+  }
+  bgButton.textContent = 'Фон: ' + BG_NAMES[bgMode];
+  localStorage.setItem('bgMode', bgMode);
+}
+applyBackground();
+
+bgButton.addEventListener('click', () => {
+  const next = (BG_MODES.indexOf(bgMode) + 1) % BG_MODES.length;
+  bgMode = BG_MODES[next];
+  applyBackground();
+});
+
+window.addEventListener('keydown', (event) => {
+  if (event.code === 'KeyH') {
+    panel.hidden = !panel.hidden;
+  }
+});
 
 // ---------- Загрузчик VRM ----------
 const loader = new GLTFLoader();
 loader.register((parser) => new VRMLoaderPlugin(parser));
 
 let currentVrm = null;
-let faceMeshes = []; // NEW
+let faceMeshes = []; 
 
 function loadVrmFromFile(file) {
   const url = URL.createObjectURL(file);
@@ -64,7 +103,7 @@ function loadVrmFromFile(file) {
       const names = Object.keys(vrm.expressionManager.expressionMap);
       exprBox.textContent = 'Выражения модели (' + names.length + '):\n' + names.join(', ');
 
-      // NEW: собираем все куски лица, у которых есть нужные формы
+      //  собираем все куски лица, у которых есть нужные формы
       faceMeshes = [];
       vrm.scene.traverse((object) => {
         if (
@@ -109,7 +148,7 @@ const RANGE = {
   smile: 0.5
 };
 const DEAD = 0.08;
-const DEAD_JAW = 0.02; // NEW
+const DEAD_JAW = 0.02; 
 
 let debugCounter = 0;
 
@@ -178,7 +217,7 @@ function setSmooth(name, target) {
   expressions.setValue(name, next);
 }
 
-// NEW: то же самое, но для отдельной формы сетки, на всех кусках лица
+//  то же самое, но для отдельной формы сетки, на всех кусках лица
 function setMorphSmooth(name, target) {
   if (faceMeshes.length === 0) return;
 
@@ -240,7 +279,7 @@ function applyFace(result) {
   setSmooth('aa', level(shapes, 'jawOpen', RANGE.jaw, DEAD_JAW));
   setSmooth('ou', level(shapes, 'mouthPucker', RANGE.pucker));
 
-  // NEW: улыбка только ртом, без прищура глаз
+  //  улыбка только ртом, без прищура глаз
   const smile =
     (level(shapes, 'mouthSmileLeft', RANGE.smile) +
       level(shapes, 'mouthSmileRight', RANGE.smile)) / 2;
