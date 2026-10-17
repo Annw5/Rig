@@ -35,6 +35,7 @@ const resetButton = document.getElementById('resetButton');
 const debugBox = document.getElementById('debug');
 const exprBox = document.getElementById('exprBox');
 const bgButton = document.getElementById('bgButton');
+const bodyButton = document.getElementById('bodyButton');
 const panel = document.getElementById('panel');
 
 // ---------- Фон ----------
@@ -141,22 +142,26 @@ try {
   neutral = {};
 }
 
+// NEW: нулевые точки тела. Они не сохраняются между запусками
+let base = {};
+const BODY_KEYS = ['headX', 'headY', 'headZ', 'gapLeft', 'gapRight'];
+
 const RANGE = {
   blink: 0.5,
   pucker: 0.5,
   smile: 0.5,
-  brow: 0.5 // NEW
+  brow: 0.5
 };
 const DEAD = 0.08;
 
-// Настройки рта (автоподстройка)
+// Рот (автоподстройка)
 const DEAD_JAW = 0.02;
 const JAW_MAX_BASE = 0.03;
 const JAW_MIN_PEAK = 0.08;
 const JAW_DECAY = 0.99;
 let jawPeak = JAW_MIN_PEAK;
 
-// Настройки головы
+// Голова
 const YAW_SIGN = -1;
 const PITCH_SIGN = 1;
 const ROLL_SIGN = -1;
@@ -165,26 +170,96 @@ const NECK_SHARE = 0.3;
 const HEAD_SMOOTH = 0.4;
 const MAX_ANGLE = { yaw: 1.0, pitch: 0.8, roll: 0.7 };
 
-// Защита от потери лица и "прыжков" углов
+// Потеря лица
 const MAX_VALID = { yaw: 1.4, pitch: 1.1, roll: 1.0 };
 const LOST_DELAY = 400;
 const RELAX_SMOOTH = 0.05;
 let lastFaceTime = 0;
 
-// NEW: настройки рук
+// NEW: положение модели в пространстве (из положения лица)
+const POS_SIGN = { x: -1, y: 1, z: 1 };
+const POS_GAIN = { x: 0.012, y: 0.012, z: 0.03 };
+const POS_MAX = { x: 0.6, y: 0.4, z: 1.2 };
+const POS_SMOOTH = 0.15;
+
+// Руки
 const ARM_SIGN = { x: -1, y: -1, z: -1 };
 const POSE_VISIBLE = 0.5;
 const ARM_SMOOTH = 0.3;
 const ARM_REST_OUT = 0.25;
 const POSE_EVERY = 2;
 
+// NEW: плечи
+const SHOULDER_SIGN = 1;
+const SHOULDER_GAIN = 2.5;
+const SHOULDER_DEAD = 0.02;
+const SHOULDER_MAX = 0.5;
+const SHOULDER_SMOOTH = 0.3;
+
+// NEW: брови
+const SORROW_GAIN = 1.0;
+
 let debugCounter = 0;
 
 // ---------- Камера и трекинг ----------
 let faceLandmarker = null;
-let poseLandmarker = null; // NEW
-let latestPose = null; // NEW
-let poseFrame = 0; // NEW
+let poseLandmarker = null;
+let visionFileset = null; // NEW
+let poseLoading = false; // NEW
+let latestPose = null;
+let latestGaps = null; // NEW
+let poseFrame = 0;
+
+// NEW: включение и выключение трекинга рук и плеч
+let bodyOn = localStorage.getItem('bodyOn') === '1';
+
+function updateBodyButton() {
+  bodyButton.textContent = 'Руки и плечи: ' + (bodyOn ? 'вкл' : 'выкл');
+}
+updateBodyButton();
+
+async function loadPose() {
+  if (!visionFileset || poseLandmarker || poseLoading) return;
+
+  poseLoading = true;
+  bodyButton.textContent = 'Загрузка тела...';
+  try {
+    poseLandmarker = await PoseLandmarker.createFromOptions(visionFileset, {
+      baseOptions: {
+        modelAssetPath:
+          'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+        delegate: 'GPU'
+      },
+      runningMode: 'VIDEO',
+      numPoses: 1
+    });
+  } catch (error) {
+    console.error('Не удалось запустить трекинг тела:', error);
+  }
+  poseLoading = false;
+  updateBodyButton();
+}
+
+function unloadPose() {
+  if (poseLandmarker) {
+    poseLandmarker.close();
+    poseLandmarker = null;
+  }
+  latestPose = null;
+  latestGaps = null;
+}
+
+bodyButton.addEventListener('click', async () => {
+  bodyOn = !bodyOn;
+  localStorage.setItem('bodyOn', bodyOn ? '1' : '0');
+  updateBodyButton();
+
+  if (bodyOn) {
+    await loadPose();
+  } else {
+    unloadPose();
+  }
+});
 
 async function startTracking() {
   try {
@@ -200,6 +275,7 @@ async function startTracking() {
     const fileset = await FilesetResolver.forVisionTasks(
       'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
     );
+    visionFileset = fileset;
 
     faceLandmarker = await FaceLandmarker.createFromOptions(fileset, {
       baseOptions: {
@@ -215,19 +291,8 @@ async function startTracking() {
 
     cameraButton.textContent = 'Камера включена';
 
-    // NEW: поза тела грузится отдельно, чтобы лицо работало, даже если тело не запустится
-    try {
-      poseLandmarker = await PoseLandmarker.createFromOptions(fileset, {
-        baseOptions: {
-          modelAssetPath:
-            'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
-          delegate: 'GPU'
-        },
-        runningMode: 'VIDEO',
-        numPoses: 1
-      });
-    } catch (poseError) {
-      console.error('Не удалось запустить трекинг тела:', poseError);
+    if (bodyOn) {
+      await loadPose();
     }
   } catch (error) {
     console.error(error);
@@ -249,12 +314,17 @@ calibrateButton.addEventListener('click', () => {
 
 resetButton.addEventListener('click', () => {
   neutral = {};
+  base = {};
   localStorage.removeItem('neutral');
 });
 
 // ---------- Помощники ----------
 function clamp01(value) {
   return Math.min(1, Math.max(0, value));
+}
+
+function limit(value, max) {
+  return Math.max(-max, Math.min(max, value));
 }
 
 function setSmooth(name, target) {
@@ -281,14 +351,14 @@ function setMorphSmooth(name, target) {
 }
 
 function level(shapes, name, range, dead = DEAD) {
-  const base = neutral[name] ?? 0;
-  const value = (shapes[name] - base) / range;
+  const base0 = neutral[name] ?? 0;
+  const value = (shapes[name] - base0) / range;
   return Math.max(0, value - dead) / (1 - dead);
 }
 
 function jawLevel(shapes) {
-  const base = Math.min(neutral.jawOpen ?? 0, JAW_MAX_BASE);
-  const value = Math.max(0, (shapes.jawOpen ?? 0) - base);
+  const jawBase = Math.min(neutral.jawOpen ?? 0, JAW_MAX_BASE);
+  const value = Math.max(0, (shapes.jawOpen ?? 0) - jawBase);
 
   jawPeak = Math.max(value, jawPeak * JAW_DECAY, JAW_MIN_PEAK);
 
@@ -304,10 +374,6 @@ const tmpEuler = new THREE.Euler();
 const targetQuaternion = new THREE.Quaternion();
 const identityQuaternion = new THREE.Quaternion();
 
-function limit(value, max) {
-  return Math.max(-max, Math.min(max, value));
-}
-
 function getHeadAngles(result) {
   const matrix = result.facialTransformationMatrixes?.[0];
   if (!matrix) return null;
@@ -316,7 +382,14 @@ function getHeadAngles(result) {
   tmpMatrix.decompose(tmpPosition, tmpQuaternion, tmpScale);
   tmpEuler.setFromQuaternion(tmpQuaternion, 'YXZ');
 
-  return { yaw: tmpEuler.y, pitch: tmpEuler.x, roll: tmpEuler.z };
+  return {
+    yaw: tmpEuler.y,
+    pitch: tmpEuler.x,
+    roll: tmpEuler.z,
+    x: tmpPosition.x, // NEW
+    y: tmpPosition.y, // NEW
+    z: tmpPosition.z // NEW
+  };
 }
 
 function rotateBone(bone, x, y, z, share) {
@@ -363,12 +436,74 @@ function relaxHead() {
   }
 }
 
-// ---------- NEW: Руки ----------
+// ---------- NEW: Положение модели (вперёд, назад, в стороны) ----------
+const posTarget = new THREE.Vector3();
+
+function applyBodyPosition(shapes) {
+  base.headX ??= shapes.headX;
+  base.headY ??= shapes.headY;
+  base.headZ ??= shapes.headZ;
+
+  posTarget.set(
+    limit((shapes.headX - base.headX) * POS_SIGN.x * POS_GAIN.x, POS_MAX.x),
+    limit((shapes.headY - base.headY) * POS_SIGN.y * POS_GAIN.y, POS_MAX.y),
+    limit((shapes.headZ - base.headZ) * POS_SIGN.z * POS_GAIN.z, POS_MAX.z)
+  );
+  currentVrm.scene.position.lerp(posTarget, POS_SMOOTH);
+}
+
+// ---------- NEW: Плечи ----------
+function getShoulderGaps() {
+  if (!latestPose) return null;
+
+  const p = latestPose.image;
+  const visible = [7, 8, 11, 12].every((i) => (p[i].visibility ?? 0) > POSE_VISIBLE);
+  if (!visible) return null;
+
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  const width = Math.hypot((p[11].x - p[12].x) * w, (p[11].y - p[12].y) * h);
+  if (width < 20) return null;
+
+  return {
+    left: ((p[11].y - p[7].y) * h) / width,
+    right: ((p[12].y - p[8].y) * h) / width
+  };
+}
+
+function applyShoulder(side, gap, baseGap) {
+  const bone = currentVrm.humanoid.getNormalizedBoneNode(
+    side === 1 ? 'leftShoulder' : 'rightShoulder'
+  );
+  if (!bone) return;
+
+  const flip = currentVrm.meta.metaVersion === '0' ? -1 : 1;
+
+  let angle = 0;
+  if (gap !== undefined && baseGap !== undefined) {
+    const diff = baseGap - gap;
+    if (Math.abs(diff) > SHOULDER_DEAD) {
+      angle = limit((diff - Math.sign(diff) * SHOULDER_DEAD) * SHOULDER_GAIN, SHOULDER_MAX);
+    }
+  }
+
+  tmpEuler.set(0, 0, side * angle * SHOULDER_SIGN * flip);
+  targetQuaternion.setFromEuler(tmpEuler);
+  bone.quaternion.slerp(targetQuaternion, SHOULDER_SMOOTH);
+}
+
+function applyShoulders() {
+  applyShoulder(1, latestGaps?.right, base.gapRight);
+  applyShoulder(-1, latestGaps?.left, base.gapLeft);
+}
+
+// ---------- Руки ----------
 const armRest = new THREE.Vector3();
 const armWant = new THREE.Vector3();
 const upperQ = new THREE.Quaternion();
 const lowerQ = new THREE.Quaternion();
 const upperInverse = new THREE.Quaternion();
+const shoulderInverse = new THREE.Quaternion(); // NEW
 const dirUpper = new THREE.Vector3();
 const dirLower = new THREE.Vector3();
 
@@ -395,6 +530,7 @@ function applyArm(side, shoulderId, elbowId, wristId) {
   const humanoid = currentVrm.humanoid;
   const upperBone = humanoid.getNormalizedBoneNode(side === 1 ? 'leftUpperArm' : 'rightUpperArm');
   const lowerBone = humanoid.getNormalizedBoneNode(side === 1 ? 'leftLowerArm' : 'rightLowerArm');
+  const shoulderBone = humanoid.getNormalizedBoneNode(side === 1 ? 'leftShoulder' : 'rightShoulder');
   if (!upperBone || !lowerBone) return;
 
   const flip = currentVrm.meta.metaVersion === '0' ? -1 : 1;
@@ -432,6 +568,12 @@ function applyArm(side, shoulderId, elbowId, wristId) {
   upperInverse.copy(upperQ).invert();
   lowerQ.premultiply(upperInverse);
 
+  // NEW: учитываем, что плечо уже повёрнуто
+  if (shoulderBone) {
+    shoulderInverse.copy(shoulderBone.quaternion).invert();
+    upperQ.premultiply(shoulderInverse);
+  }
+
   upperBone.quaternion.slerp(upperQ, ARM_SMOOTH);
   lowerBone.quaternion.slerp(lowerQ, ARM_SMOOTH);
 }
@@ -448,8 +590,14 @@ function updatePose() {
   const result = poseLandmarker.detectForVideo(video, performance.now());
   if (result.landmarks.length > 0 && result.worldLandmarks.length > 0) {
     latestPose = { image: result.landmarks[0], world: result.worldLandmarks[0] };
+    latestGaps = getShoulderGaps();
+    if (latestGaps) {
+      base.gapLeft ??= latestGaps.left;
+      base.gapRight ??= latestGaps.right;
+    }
   } else {
     latestPose = null;
+    latestGaps = null;
   }
 }
 
@@ -465,6 +613,13 @@ function applyFace(result) {
     shapes.headYaw = headAngles.yaw;
     shapes.headPitch = headAngles.pitch;
     shapes.headRoll = headAngles.roll;
+    shapes.headX = headAngles.x;
+    shapes.headY = headAngles.y;
+    shapes.headZ = headAngles.z;
+  }
+  if (latestGaps) {
+    shapes.gapLeft = latestGaps.left;
+    shapes.gapRight = latestGaps.right;
   }
 
   if (calibration) {
@@ -477,6 +632,13 @@ function applyFace(result) {
       for (const name in calibration.sums) {
         neutral[name] = calibration.sums[name] / calibration.count;
       }
+      // NEW: данные тела уходят в base и не сохраняются
+      for (const key of BODY_KEYS) {
+        if (neutral[key] !== undefined) {
+          base[key] = neutral[key];
+          delete neutral[key];
+        }
+      }
       localStorage.setItem('neutral', JSON.stringify(neutral));
       calibration = null;
       calibrateButton.textContent = 'Калибровка';
@@ -488,7 +650,7 @@ function applyFace(result) {
     const names = [
       'eyeBlinkLeft', 'eyeBlinkRight', 'jawOpen',
       'mouthPucker', 'mouthSmileLeft', 'mouthSmileRight',
-      'browInnerUp', 'browDownLeft', 'browOuterUpLeft',
+      'browInnerUp', 'browOuterUpLeft', 'browDownLeft',
       'headYaw', 'headPitch', 'headRoll'
     ];
     debugBox.textContent =
@@ -496,7 +658,8 @@ function applyFace(result) {
         .map((n) => n + ': сейчас ' + (shapes[n] ?? 0).toFixed(2) + ', покой ' + (neutral[n] ?? 0).toFixed(2))
         .join('\n') +
       '\nпик рта: ' + jawPeak.toFixed(2) +
-      '\nтело: ' + (latestPose ? 'видно' : 'не видно');
+      '\nтело: ' + (latestPose ? 'видно' : 'не видно') +
+      '\nдистанция: ' + (shapes.headZ ?? 0).toFixed(1) + ' см';
   }
 
   setSmooth('blinkLeft', level(shapes, 'eyeBlinkLeft', RANGE.blink));
@@ -510,20 +673,22 @@ function applyFace(result) {
   setMorphSmooth('Fcl_MTH_Joy', smile);
 
   // NEW: брови
-  const browUp =
+  const browOuter =
     (level(shapes, 'browOuterUpLeft', RANGE.brow) +
       level(shapes, 'browOuterUpRight', RANGE.brow)) / 2;
   const browDown =
     (level(shapes, 'browDownLeft', RANGE.brow) +
       level(shapes, 'browDownRight', RANGE.brow)) / 2;
   const browInner = level(shapes, 'browInnerUp', RANGE.brow);
+  const browSorrow = clamp01((browInner - browOuter) * SORROW_GAIN);
 
-  setMorphSmooth('Fcl_BRW_Surprised', browUp);
+  setMorphSmooth('Fcl_BRW_Surprised', browOuter);
   setMorphSmooth('Fcl_BRW_Angry', browDown);
-  setMorphSmooth('Fcl_BRW_Sorrow', browInner);
+  setMorphSmooth('Fcl_BRW_Sorrow', browSorrow);
 
   if (headAngles) {
     applyHead(shapes);
+    applyBodyPosition(shapes);
   }
 }
 
@@ -544,8 +709,8 @@ function animate() {
       applyFace(result);
     }
 
-    if (poseLandmarker) {
-      updatePose(); // NEW
+    if (bodyOn && poseLandmarker) {
+      updatePose();
     }
   }
 
@@ -554,7 +719,8 @@ function animate() {
   }
 
   if (currentVrm) {
-    applyArms(); // NEW
+    applyShoulders(); // NEW
+    applyArms();
     currentVrm.update(delta);
   }
 
