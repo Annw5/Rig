@@ -110,6 +110,12 @@ async function startTracking() {
 }
 
 cameraButton.addEventListener('click', startTracking);
+const resetButton = document.getElementById('resetButton');
+
+resetButton.addEventListener('click', () => {
+  neutral = {};
+  localStorage.removeItem('neutral');
+});
 
 // ---------- Калибровка и настройки ----------
 let neutral = {};
@@ -128,6 +134,9 @@ const RANGE = {
   smile: 0.5
 };
 const HAPPY_MAX = 0.5;
+const DEAD = 0.08;
+const debugBox = document.getElementById('debug');
+let debugCounter = 0;
 
 // ---------- Помощники ----------
 function clamp01(value) {
@@ -143,7 +152,8 @@ function setSmooth(name, target) {
 
 function level(shapes, name, range) {
   const base = neutral[name] ?? 0;
-  return (shapes[name] - base) / range;
+  const value = (shapes[name] - base) / range;
+  return Math.max(0, value - DEAD) / (1 - DEAD);
 }
 
 // ---------- Применяем лицо к модели ----------
@@ -168,7 +178,16 @@ function applyFace(result) {
       calibrateButton.textContent = 'Калибровка';
     }
   }
-
+debugCounter++;
+if (debugCounter % 10 === 0) {
+  const names = [
+    'eyeBlinkLeft', 'eyeBlinkRight', 'jawOpen',
+    'mouthPucker', 'mouthSmileLeft', 'mouthSmileRight'
+  ];
+  debugBox.textContent = names
+    .map((n) => n + ': сейчас ' + shapes[n].toFixed(2) + ', покой ' + (neutral[n] ?? 0).toFixed(2))
+    .join('\n');
+}
   setSmooth('blinkLeft', level(shapes, 'eyeBlinkLeft', RANGE.blink));
   setSmooth('blinkRight', level(shapes, 'eyeBlinkRight', RANGE.blink));
   setSmooth('aa', level(shapes, 'jawOpen', RANGE.jaw));
@@ -180,20 +199,6 @@ function applyFace(result) {
   setSmooth('happy', smile * HAPPY_MAX);
 }
 
-// ---------- Применяем лицо к модели ----------
-function applyFace(result) {
-  const shapes = {};
-  for (const item of result.faceBlendshapes[0].categories) {
-    shapes[item.categoryName] = item.score;
-  }
-
-  setSmooth('blinkLeft', shapes.eyeBlinkLeft * 1.2);
-  setSmooth('blinkRight', shapes.eyeBlinkRight * 1.2);
-  setSmooth('aa', shapes.jawOpen * 1.5);
-  setSmooth('ou', shapes.mouthPucker * 1.5);
-  setSmooth('happy', (shapes.mouthSmileLeft + shapes.mouthSmileRight) / 2 * 1.5);
-}
-
 // ---------- Главный цикл ----------
 const clock = new THREE.Clock();
 let lastVideoTime = -1; // NEW
@@ -202,7 +207,7 @@ function animate() {
   requestAnimationFrame(animate);
   const delta = clock.getDelta();
 
-  // NEW: трекинг
+  //  трекинг
   if (faceLandmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
     lastVideoTime = video.currentTime;
     const result = faceLandmarker.detectForVideo(video, performance.now());
