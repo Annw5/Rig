@@ -88,19 +88,14 @@ fileInput.addEventListener('change', (event) => {
 });
 
 // ---------- Настройки ----------
-const REST = {
-  eyeBlinkLeft: 0.14,
-  eyeBlinkRight: 0.10
-};
 
-let neutral = { ...REST };
+let neutral = {};
 let calibration = null;
 
 try {
-  const saved = JSON.parse(localStorage.getItem('neutral')) ?? {};
-  neutral = { ...saved, ...REST };
+  neutral = JSON.parse(localStorage.getItem('neutral')) ?? {};
 } catch (error) {
-  neutral = { ...REST };
+  neutral = {};
 }
 
 const RANGE = {
@@ -163,7 +158,7 @@ calibrateButton.addEventListener('click', () => {
 });
 
 resetButton.addEventListener('click', () => {
-  neutral = { ...REST };
+  neutral = { };
   localStorage.removeItem('neutral');
 });
 
@@ -206,7 +201,6 @@ function applyFace(result) {
       for (const name in calibration.sums) {
         neutral[name] = calibration.sums[name] / calibration.count;
       }
-      Object.assign(neutral, REST);
       localStorage.setItem('neutral', JSON.stringify(neutral));
       calibration = null;
       calibrateButton.textContent = 'Калибровка';
