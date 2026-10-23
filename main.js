@@ -546,3 +546,416 @@ function applyHeadBones(smooth) {
   const head = humanoid.getNormalizedBoneNode('head');
 
   tmpEuler.set(
+    headTarget.pitch * NECK_SHARE,
+    headTarget.yaw * NECK_SHARE,
+    headTarget.roll * NECK_SHARE,
+    'YXZ'
+  );
+  worldQ.setFromEuler(tmpEuler);
+  applyWorldRotation(neck, worldQ, smooth);
+
+  tmpEuler.set(headTarget.pitch, headTarget.yaw, headTarget.roll, 'YXZ');
+  worldQ.setFromEuler(tmpEuler);
+  applyWorldRotation(head, worldQ, smooth);
+}
+
+// Положение головы двигает только шею и голову, тело стоит на месте
+function updateHeadOffset(shapes) {
+  base.headX ??= shapes.headX;
+  base.headY ??= shapes.headY;
+  base.headZ ??= shapes.headZ;
+
+  headOffset.x = limit((shapes.headX - base.headX) * HEAD_POS_SIGN.x * HEAD_POS_GAIN.x, HEAD_POS_MAX.x);
+  headOffset.y = limit((shapes.headY - base.headY) * HEAD_POS_SIGN.y * HEAD_POS_GAIN.y, HEAD_POS_MAX.y);
+  headOffset.z = limit((shapes.headZ - base.headZ) * HEAD_POS_SIGN.z * HEAD_POS_GAIN.z, HEAD_POS_MAX.z);
+}
+
+function applyHeadOffset() {
+  offsetBone('neck', headOffset.x * NECK_SHARE, headOffset.y * NECK_SHARE, headOffset.z * NECK_SHARE);
+  offsetBone('head', headOffset.x, headOffset.y, headOffset.z);
+}
+
+// ---------- Туловище (наклон вбок и поворот) ----------
+function getTorsoAngles() {
+  if (!latestPose) return null;
+
+  const p = latestPose.image;
+  const wz = latestPose.world;
+
+  if ((p[11].visibility ?? 0) < POSE_VISIBLE || (p[12].visibility ?? 0) < POSE_VISIBLE) {
+    return null;
+  }
+
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+
+  return {
+    roll: Math.atan2((p[11].y - p[12].y) * h, (p[11].x - p[12].x) * w),
+    yaw: Math.atan2(wz[11].z - wz[12].z, wz[11].x - wz[12].x)
+  };
+}
+
+function updateTorsoTarget() {
+  torso.yaw = 0;
+  torso.roll = 0;
+
+  if (latestTorso && base.torsoRoll !== undefined && base.torsoYaw !== undefined) {
+    const roll = deadZone(latestTorso.roll - base.torsoRoll, TORSO_DEAD);
+    const yaw = deadZone(latestTorso.yaw - base.torsoYaw, TORSO_DEAD);
+    torso.roll = limit(roll * TORSO_ROLL_SIGN, TORSO_MAX.roll);
+    torso.yaw = limit(yaw * TORSO_YAW_SIGN, TORSO_MAX.yaw);
+  }
+}
+
+function applyTorso() {
+  torsoBones.forEach((bone, i) => {
+    const share = (i + 1) / torsoBones.length;
+    tmpEuler.set(0, torso.yaw * share, torso.roll * share, 'YXZ');
+    worldQ.setFromEuler(tmpEuler);
+    applyWorldRotation(bone, worldQ, TORSO_SMOOTH);
+  });
+}
+
+// ---------- Плечи ----------
+// Высота каждого плеча считается относительно средней высоты ушей
+// (наклон головы почти не мешает). Глубина берётся из мировых координат тела
+function getShoulderData() {
+  if (!latestPose) return null;
+
+  const p = latestPose.image;
+  const wz = latestPose.world;
+
+  if ((p[11].visibility ?? 0) < POSE_VISIBLE || (p[12].visibility ?? 0) < POSE_VISIBLE) {
+    return null;
+  }
+
+  let sum = 0;
+  let n = 0;
+  for (const i of [7, 8]) {
+    if ((p[i].visibility ?? 0) > POSE_VISIBLE) {
+      sum += p[i].y;
+      n++;
+    }
+  }
+  if (n === 0) return null;
+  const refY = sum / n;
+
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  const width = Math.hypot((p[11].x - p[12].x) * w, (p[11].y - p[12].y) * h);
+  if (width < 20) return null;
+
+  return {
+    left: ((p[11].y - refY) * h) / width,
+    right: ((p[12].y - refY) * h) / width,
+    depthLeft: wz[11].z,
+    depthRight: wz[12].z
+  };
+}
+
+function applyShoulder(side, boneName, gap, baseGap, depth, baseDepth) {
+  const bone = currentVrm.humanoid.getNormalizedBoneNode(boneName);
+  if (!bone) return;
+
+  // Подъём и опускание: поворот ЛОКАЛЬНЫЙ, чтобы плечо ехало вместе с торсом
+  let angle = 0;
+  if (gap !== undefined && baseGap !== undefined) {
+    angle = limit(deadZone(baseGap - gap, SHOULDER_DEAD) * SHOULDER_GAIN, SHOULDER_MAX);
+  }
+
+  // VRM0 повёрнут на 180° по Y, поэтому ось Z локально зеркальная
+  tmpEuler.set(0, 0, side * angle * SHOULDER_SIGN * vrmFlip(), 'YXZ');
+  worldQ.setFromEuler(tmpEuler);
+  bone.quaternion.slerp(worldQ, SHOULDER_SMOOTH);
+
+  // Глубина этого плеча
+  let dz = 0;
+  if (depth !== undefined && baseDepth !== undefined) {
+    dz = limit(
+      deadZone((depth - baseDepth) * SHOULDER_DEPTH_SIGN, SHOULDER_DEPTH_DEAD) * SHOULDER_DEPTH_GAIN,
+      SHOULDER_DEPTH_MAX
+    );
+  }
+  offsetBone(boneName, 0, 0, dz);
+}
+
+function applyShoulders() {
+  const s = latestShoulders;
+  applyShoulder(1, 'leftShoulder', s?.right, base.gapRight, s?.depthRight, base.depthRight);
+  applyShoulder(-1, 'rightShoulder', s?.left, base.gapLeft, s?.depthLeft, base.depthLeft);
+}
+
+// ---------- Руки ----------
+const armRest = new THREE.Vector3();
+const armWant = new THREE.Vector3();
+const dirUpper = new THREE.Vector3();
+const dirLower = new THREE.Vector3();
+const upperQ = new THREE.Quaternion();
+const lowerQ = new THREE.Quaternion();
+
+function setDirection(from, to, target) {
+  target.set(
+    (to.x - from.x) * ARM_SIGN.x,
+    (to.y - from.y) * ARM_SIGN.y,
+    (to.z - from.z) * ARM_SIGN.z
+  );
+}
+
+function quaternionFromDirection(side, dir, out) {
+  if (dir.lengthSq() < 0.000001) {
+    out.identity();
+    return;
+  }
+  armRest.set(side, 0, 0);
+  armWant.copy(dir).normalize();
+  out.setFromUnitVectors(armRest, armWant);
+}
+
+function applyArm(side, shoulderId, elbowId, wristId) {
+  const humanoid = currentVrm.humanoid;
+  const upperBone = humanoid.getNormalizedBoneNode(side === 1 ? 'leftUpperArm' : 'rightUpperArm');
+  const lowerBone = humanoid.getNormalizedBoneNode(side === 1 ? 'leftLowerArm' : 'rightLowerArm');
+  if (!upperBone || !lowerBone) return;
+
+  let upperVisible = false;
+  let lowerVisible = false;
+
+  // Если руки выключены, они возвращаются в спокойную позу
+  if (latestPose && armsOn) {
+    const image = latestPose.image;
+    const world = latestPose.world;
+
+    upperVisible =
+      (image[shoulderId].visibility ?? 0) > POSE_VISIBLE &&
+      (image[elbowId].visibility ?? 0) > POSE_VISIBLE;
+    lowerVisible = upperVisible && (image[wristId].visibility ?? 0) > POSE_VISIBLE;
+
+    if (upperVisible) {
+      setDirection(world[shoulderId], world[elbowId], dirUpper);
+    }
+    if (lowerVisible) {
+      setDirection(world[elbowId], world[wristId], dirLower);
+    }
+  }
+
+  if (!upperVisible) {
+    dirUpper.set(side * ARM_REST_OUT, -1, 0);
+  }
+  if (!lowerVisible) {
+    dirLower.copy(dirUpper);
+  }
+
+  quaternionFromDirection(side, dirUpper, upperQ);
+  quaternionFromDirection(side, dirLower, lowerQ);
+
+  // Руки абсолютные: учитывают и торс, и плечо
+  applyWorldRotation(upperBone, upperQ, ARM_SMOOTH);
+  applyWorldRotation(lowerBone, lowerQ, ARM_SMOOTH);
+}
+
+function applyArms() {
+  applyArm(1, 12, 14, 16);
+  applyArm(-1, 11, 13, 15);
+}
+
+function updatePose() {
+  poseFrame++;
+  if (poseFrame % POSE_EVERY !== 0) return;
+
+  const result = poseLandmarker.detectForVideo(video, performance.now());
+  if (result.landmarks.length > 0 && result.worldLandmarks.length > 0) {
+    latestPose = { image: result.landmarks[0], world: result.worldLandmarks[0] };
+    latestShoulders = getShoulderData();
+    latestTorso = getTorsoAngles();
+
+    if (latestShoulders) {
+      base.gapLeft ??= latestShoulders.left;
+      base.gapRight ??= latestShoulders.right;
+      base.depthLeft ??= latestShoulders.depthLeft;
+      base.depthRight ??= latestShoulders.depthRight;
+    }
+    if (latestTorso) {
+      base.torsoRoll ??= latestTorso.roll;
+      base.torsoYaw ??= latestTorso.yaw;
+    }
+  } else {
+    latestPose = null;
+    latestShoulders = null;
+    latestTorso = null;
+  }
+}
+
+// ---------- Применяем лицо к модели ----------
+function applyFace(result) {
+  const shapes = {};
+  for (const item of result.faceBlendshapes[0].categories) {
+    shapes[item.categoryName] = item.score;
+  }
+
+  const headAngles = getHeadAngles(result);
+  if (headAngles) {
+    shapes.headYaw = headAngles.yaw;
+    shapes.headPitch = headAngles.pitch;
+    shapes.headRoll = headAngles.roll;
+    shapes.headX = headAngles.x;
+    shapes.headY = headAngles.y;
+    shapes.headZ = headAngles.z;
+  }
+  if (latestShoulders) {
+    shapes.gapLeft = latestShoulders.left;
+    shapes.gapRight = latestShoulders.right;
+    shapes.depthLeft = latestShoulders.depthLeft;
+    shapes.depthRight = latestShoulders.depthRight;
+  }
+  if (latestTorso) {
+    shapes.torsoRoll = latestTorso.roll;
+    shapes.torsoYaw = latestTorso.yaw;
+  }
+
+  if (calibration) {
+    for (const name in shapes) {
+      calibration.sums[name] = (calibration.sums[name] ?? 0) + shapes[name];
+      calibration.counts[name] = (calibration.counts[name] ?? 0) + 1;
+    }
+
+    if (performance.now() > calibration.endTime) {
+      for (const name in calibration.sums) {
+        neutral[name] = calibration.sums[name] / calibration.counts[name];
+      }
+      // Данные тела уходят в base и не сохраняются
+      for (const key of BODY_KEYS) {
+        if (neutral[key] !== undefined) {
+          base[key] = neutral[key];
+          delete neutral[key];
+        }
+      }
+      localStorage.setItem('neutral', JSON.stringify(neutral));
+      calibration = null;
+      calibrateButton.textContent = 'Калибровка';
+    }
+  }
+
+  debugCounter++;
+  if (debugCounter % 10 === 0) {
+    const names = [
+      'eyeBlinkLeft', 'eyeBlinkRight', 'jawOpen',
+      'mouthPucker', 'mouthSmileLeft', 'mouthSmileRight',
+      'browInnerUp', 'browOuterUpLeft', 'browOuterUpRight',
+      'browDownLeft', 'browDownRight',
+      'headYaw', 'headPitch', 'headRoll'
+    ];
+    debugBox.textContent =
+      names
+        .map((n) => n + ': сейчас ' + (shapes[n] ?? 0).toFixed(2) + ', покой ' + (neutral[n] ?? 0).toFixed(2))
+        .join('\n') +
+      '\nпик рта: ' + jawPeak.toFixed(2) +
+      '\nтело: ' + (latestPose ? 'видно' : 'не видно') +
+      '\nраздельные брови: ' + (browSplit ? 'да' : 'нет') +
+      '\nкостей торса: ' + torsoBones.length +
+      '\nдистанция: ' + (shapes.headZ ?? 0).toFixed(1) + ' см' +
+      '\nплечи зазор L/R: ' + fmt(latestShoulders?.left) + ' / ' + fmt(latestShoulders?.right) +
+      ' (покой ' + fmt(base.gapLeft) + ' / ' + fmt(base.gapRight) + ')' +
+      '\nплечи глубина L/R: ' + fmt(latestShoulders?.depthLeft) + ' / ' + fmt(latestShoulders?.depthRight) +
+      '\nкорпус наклон/поворот: ' + fmt(latestTorso?.roll) + ' / ' + fmt(latestTorso?.yaw) +
+      ' (покой ' + fmt(base.torsoRoll) + ' / ' + fmt(base.torsoYaw) + ')';
+  }
+
+  setSmooth('blinkLeft', level(shapes, 'eyeBlinkLeft', RANGE.blink));
+  setSmooth('blinkRight', level(shapes, 'eyeBlinkRight', RANGE.blink));
+  setSmooth('aa', jawLevel(shapes));
+  setSmooth('ou', level(shapes, 'mouthPucker', RANGE.pucker));
+
+  const smile =
+    (level(shapes, 'mouthSmileLeft', RANGE.smile) +
+      level(shapes, 'mouthSmileRight', RANGE.smile)) / 2;
+  setMorphSmooth('Fcl_MTH_Joy', smile);
+
+  const browInner = level(shapes, 'browInnerUp', RANGE.brow);
+
+  if (browSplit) {
+    // Каждая бровь живёт своей жизнью
+    for (const side of ['Left', 'Right']) {
+      const outer = level(shapes, 'browOuterUp' + side, RANGE.brow);
+      const down = level(shapes, 'browDown' + side, RANGE.brow);
+      const sorrow = clamp01((browInner - outer) * SORROW_GAIN);
+      const suffix = (side === 'Left') !== BROW_SWAP ? '_L' : '_R';
+
+      setMorphSmooth('Fcl_BRW_Surprised' + suffix, outer);
+      setMorphSmooth('Fcl_BRW_Angry' + suffix, down);
+      setMorphSmooth('Fcl_BRW_Sorrow' + suffix, sorrow);
+    }
+  } else {
+    // Запасной вариант: симметричные брови
+    const browOuter =
+      (level(shapes, 'browOuterUpLeft', RANGE.brow) +
+        level(shapes, 'browOuterUpRight', RANGE.brow)) / 2;
+    const browDown =
+      (level(shapes, 'browDownLeft', RANGE.brow) +
+        level(shapes, 'browDownRight', RANGE.brow)) / 2;
+    const browSorrow = clamp01((browInner - browOuter) * SORROW_GAIN);
+
+    setMorphSmooth('Fcl_BRW_Surprised', browOuter);
+    setMorphSmooth('Fcl_BRW_Angry', browDown);
+    setMorphSmooth('Fcl_BRW_Sorrow', browSorrow);
+  }
+
+  if (headAngles) {
+    updateHeadTarget(shapes);
+    updateHeadOffset(shapes);
+  }
+}
+
+// ---------- Главный цикл ----------
+const clock = new THREE.Clock();
+let lastVideoTime = -1;
+
+function animate() {
+  requestAnimationFrame(animate);
+  const delta = clock.getDelta();
+
+  if (faceLandmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+
+    // Сначала тело, чтобы плечи и торс были свежими, когда считается лицо
+    if (poseLandmarker) {
+      updatePose();
+    }
+
+    const result = faceLandmarker.detectForVideo(video, performance.now());
+    if (currentVrm && result.faceBlendshapes.length > 0) {
+      lastFaceTime = performance.now();
+      applyFace(result);
+    }
+  }
+
+  if (currentVrm) {
+    const faceLost = faceLandmarker && performance.now() - lastFaceTime > LOST_DELAY;
+    if (faceLost) {
+      headTarget.yaw = 0;
+      headTarget.pitch = 0;
+      headTarget.roll = 0;
+      headOffset.x = 0;
+      headOffset.y = 0;
+      headOffset.z = 0;
+    }
+
+    // Порядок важен: сначала туловище, потом то, что к нему прикреплено
+    updateTorsoTarget();
+    applyTorso();
+    applyShoulders();
+    applyHeadBones(faceLost ? RELAX_SMOOTH : HEAD_SMOOTH);
+    applyHeadOffset();
+    applyArms();
+
+    currentVrm.update(delta);
+  }
+
+  renderer.render(scene, camera);
+}
+animate();
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
