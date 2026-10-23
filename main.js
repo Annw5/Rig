@@ -571,9 +571,12 @@ function applyShoulder(side, gap, baseGap) {
     angle = limit(deadZone(baseGap - gap, SHOULDER_DEAD) * SHOULDER_GAIN, SHOULDER_MAX);
   }
 
-  tmpEuler.set(0, 0, side * angle * SHOULDER_SIGN, 'YXZ');
+  // VRM0 повёрнут на 180° по Y, поэтому ось Z локально зеркальная
+  const flip = currentVrm.meta.metaVersion === '0' ? -1 : 1;
+
+  tmpEuler.set(0, 0, side * angle * SHOULDER_SIGN * flip, 'YXZ');
   worldQ.setFromEuler(tmpEuler);
-  applyWorldRotation(bone, worldQ, SHOULDER_SMOOTH);
+  bone.quaternion.slerp(worldQ, SHOULDER_SMOOTH); // локально, без applyWorldRotation
 }
 
 function applyShoulders() {
@@ -701,6 +704,21 @@ function applyFace(result) {
     shapes.torsoRoll = latestTorso.roll;
     shapes.torsoYaw = latestTorso.yaw;
   }
+
+const refY = (p[7].y + p[8].y) / 2;
+return {
+  left: ((p[11].y - refY) * h) / width,
+  right: ((p[12].y - refY) * h) / width
+};
+  
+  calibration = { endTime: performance.now() + 2000, sums: {}, counts: {} };
+// в applyFace:
+for (const name in shapes) {
+  calibration.sums[name] = (calibration.sums[name] ?? 0) + shapes[name];
+  calibration.counts[name] = (calibration.counts[name] ?? 0) + 1;
+}
+// при завершении:
+neutral[name] = calibration.sums[name] / calibration.counts[name];
 
   if (calibration) {
     for (const name in shapes) {
