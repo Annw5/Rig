@@ -1,7 +1,12 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
-import { FaceLandmarker, PoseLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
+import {
+  FaceLandmarker,
+  PoseLandmarker,
+  HandLandmarker,
+  FilesetResolver
+} from '@mediapipe/tasks-vision';
 
 // ---------- Общие переменные ----------
 let currentVrm = null;
@@ -41,7 +46,7 @@ const resetButton = document.getElementById('resetButton');
 const debugBox = document.getElementById('debug');
 const exprBox = document.getElementById('exprBox');
 const bgButton = document.getElementById('bgButton');
-const armsButton = document.getElementById('bodyButton'); // та же кнопка, теперь только для рук
+const armsButton = document.getElementById('bodyButton'); // кнопка рук (руки, кисти, пальцы)
 const panel = document.getElementById('panel');
 
 // ---------- Фон ----------
@@ -144,6 +149,18 @@ const ARM_SMOOTH = 0.2;
 const ARM_REST_OUT = 0.25;
 const POSE_EVERY = 2;
 
+// Кисти и пальцы
+const WRIST_ON = true;          // false = кисти не поворачиваются, только пальцы
+const HAND_SMOOTH = 0.3;        // плавность поворота кисти
+const HAND_EVERY = 2;           // трекинг кистей раз в N кадров
+const FINGER_SIGN = 1;          // если пальцы сгибаются в обратную сторону, поставь -1
+const THUMB_SIGN = 1;           // то же для большого пальца
+const FINGER_GAIN = 1.1;        // сила сгиба
+const FINGER_DEAD = 0.08;       // мёртвая зона сгиба, радианы
+const FINGER_MAX = { proximal: 1.5, intermediate: 1.9, distal: 1.3 }; // максимум сгиба, радианы
+const FINGER_REST = 0.12;       // лёгкий естественный изгиб, когда кисть не видна
+const FINGER_SMOOTH = 0.4;
+
 // Плечи: подъём и опускание (у каждого плеча отдельно)
 const SHOULDER_SIGN = 1;
 const SHOULDER_GAIN = 3;
@@ -174,9 +191,9 @@ const FILTER_BETA = 5;
 // Взгляд (зрачки)
 const GAZE_YAW_SIGN = 1;     // если глаза смотрят в другую сторону по горизонтали, поставь -1
 const GAZE_PITCH_SIGN = 1;   // если глаза смотрят в другую сторону по вертикали, поставь -1
-const GAZE_RANGE = { x: 0.6, y: 0.5 }; // какое значение MediaPipe считать «до упора»
+const GAZE_RANGE = { x: 0.6, y: 0.5 };
 const GAZE_DEAD = 0.03;
-const GAZE_MAX = { yaw: 90, pitch: 90 }; // градусы на входе lookAt (модель сама ограничивает ход глаз)
+const GAZE_MAX = { yaw: 90, pitch: 90 };
 const GAZE_SMOOTH = 0.5;
 const GAZE_FILTER_CUTOFF = 1.0;
 const gazeTarget = { yaw: 0, pitch: 0 };
@@ -184,9 +201,9 @@ const gaze = { yaw: 0, pitch: 0 };
 
 // Брови
 const SORROW_GAIN = 0.7;
-const BROW_GAIN = 1.3;       // общая сила бровей
+const BROW_GAIN = 1.3;
 const BROW_MORPHS = ['Fcl_BRW_Surprised', 'Fcl_BRW_Angry', 'Fcl_BRW_Sorrow'];
-const BROW_SEAM = 0.015;     // мягкая граница между половинами лица, в метрах
+const BROW_SEAM = 0.015;
 // Если левая и правая бровь работают наоборот, поставь true
 const BROW_SWAP = false;
 
@@ -248,7 +265,7 @@ class OneEuro {
   }
 }
 
-// Фильтры точек тела
+// Фильтры точек тела и кистей
 let landmarkFilters = {};
 
 function getFilter(key) {
@@ -265,6 +282,12 @@ function smoothLandmarks(list, kind, time) {
     z: getFilter(kind + i + 'z').filter(point.z, time),
     visibility: point.visibility
   }));
+}
+
+function resetFilters(prefix) {
+  for (const key in landmarkFilters) {
+    if (key.startsWith(prefix)) delete landmarkFilters[key];
+  }
 }
 
 // Фильтры взгляда
@@ -387,8 +410,12 @@ function loadVrmFromFile(file) {
       gaze.yaw = 0;
       gaze.pitch = 0;
 
+      const fingerCount = ['leftIndexProximal', 'rightIndexProximal', 'leftThumbProximal']
+        .filter((name) => vrm.humanoid.getNormalizedBoneNode(name)).length;
+
       console.log('Кусков лица с формами:', faceMeshes.length);
       console.log('Костей туловища:', torsoBones.length);
+      console.log('Кости пальцев найдены:', fingerCount > 0 ? 'да' : 'нет');
       console.log('Управление взглядом:', vrm.lookAt ? 'есть' : 'нет');
       console.log('Версия VRM:', vrm.meta.metaVersion);
     },
@@ -410,14 +437,18 @@ fileInput.addEventListener('change', (event) => {
 // ---------- Камера и трекинг ----------
 let faceLandmarker = null;
 let poseLandmarker = null;
+let handLandmarker = null;
 let visionFileset = null;
 let poseLoading = false;
+let handLoading = false;
 let latestPose = null;
 let latestShoulders = null;
 let latestTorso = null;
+let latestHands = { left: null, right: null }; // left/right = стороны МОДЕЛИ
 let poseFrame = 0;
+let handFrame = 0;
 
-// Кнопка включает и выключает ТОЛЬКО руки
+// Кнопка включает и выключает руки, кисти и пальцы
 let armsOn = localStorage.getItem('armsOn') === '1';
 
 function updateArmsButton() {
@@ -425,10 +456,16 @@ function updateArmsButton() {
 }
 updateArmsButton();
 
-armsButton.addEventListener('click', () => {
+armsButton.addEventListener('click', async () => {
   armsOn = !armsOn;
   localStorage.setItem('armsOn', armsOn ? '1' : '0');
   updateArmsButton();
+
+  if (armsOn) {
+    await loadHands();
+  } else {
+    unloadHands();
+  }
 });
 
 // Трекинг тела грузится всегда: он нужен для плеч и торса
@@ -452,14 +489,95 @@ async function loadPose() {
   poseLoading = false;
 }
 
+// Трекинг кистей грузится только когда включены руки
+async function loadHands() {
+  if (!visionFileset || handLandmarker || handLoading) return;
+
+  handLoading = true;
+  const oldText = armsButton.textContent;
+  armsButton.textContent = 'Загрузка кистей...';
+  try {
+    handLandmarker = await HandLandmarker.createFromOptions(visionFileset, {
+      baseOptions: {
+        modelAssetPath:
+          'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+        delegate: 'GPU'
+      },
+      runningMode: 'VIDEO',
+      numHands: 2
+    });
+  } catch (error) {
+    console.error('Не удалось запустить трекинг кистей:', error);
+  }
+  handLoading = false;
+  armsButton.textContent = oldText;
+  updateArmsButton();
+}
+
+function unloadHands() {
+  if (handLandmarker) {
+    handLandmarker.close();
+    handLandmarker = null;
+  }
+  latestHands = { left: null, right: null };
+  resetFilters('hL');
+  resetFilters('hR');
+}
+
+function stopCamera() {
+  const stream = video.srcObject;
+  if (stream) {
+    stream.getTracks().forEach((track) => track.stop());
+    video.srcObject = null;
+  }
+}
+
+// Камера запрашивается каскадом: от лучшего режима к самому простому
+async function openCamera() {
+  const attempts = [
+    { video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60 } } },
+    { video: { width: { ideal: 640 }, height: { ideal: 480 } } },
+    { video: true }
+  ];
+
+  let lastError = null;
+  for (const constraints of attempts) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (error) {
+      lastError = error;
+      // Запрет доступа повторять бессмысленно
+      if (error.name === 'NotAllowedError' || error.name === 'SecurityError') break;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+  }
+  throw lastError;
+}
+
+function cameraErrorMessage(error) {
+  switch (error?.name) {
+    case 'NotReadableError':
+    case 'AbortError':
+      return 'Не удалось занять камеру: её, скорее всего, использует другое приложение или вкладка (OBS, Zoom, Discord, Telegram, другая вкладка). Закрой их и нажми кнопку ещё раз. Если не помогло, перезагрузи страницу или переподключи камеру.';
+    case 'NotAllowedError':
+    case 'SecurityError':
+      return 'Нет доступа к камере. Разреши камеру для этого сайта в настройках браузера (значок замка рядом с адресом) и перезагрузи страницу.';
+    case 'NotFoundError':
+    case 'OverconstrainedError':
+      return 'Камера не найдена. Проверь, что она подключена и включена в системе.';
+    default:
+      return 'Не получилось включить камеру или трекинг. Подробности в консоли (F12).';
+  }
+}
+
 async function startTracking() {
   try {
     cameraButton.disabled = true;
     cameraButton.textContent = 'Загрузка...';
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: 1280, height: 720, frameRate: 60 }
-    });
+    stopCamera(); // на случай прошлой неудачной попытки
+
+    const stream = await openCamera();
     video.srcObject = stream;
     await video.play();
 
@@ -483,9 +601,13 @@ async function startTracking() {
     cameraButton.textContent = 'Камера включена';
 
     await loadPose();
+    if (armsOn) {
+      await loadHands();
+    }
   } catch (error) {
     console.error(error);
-    alert('Не получилось включить камеру или трекинг. Подробности в консоли (F12).');
+    stopCamera(); // освобождаем камеру, чтобы повторная попытка сработала
+    alert(cameraErrorMessage(error));
     cameraButton.disabled = false;
     cameraButton.textContent = 'Включить камеру';
   }
@@ -600,10 +722,8 @@ function applyBrows(shapes) {
 function updateGazeTarget(shapes, time) {
   const v = (name) => (shapes[name] ?? 0) - (neutral[name] ?? 0);
 
-  // Плюс = пользователь смотрит влево (его левый глаз наружу, правый внутрь)
   const horizontal =
     (v('eyeLookOutLeft') + v('eyeLookInRight') - v('eyeLookInLeft') - v('eyeLookOutRight')) / 2;
-  // Плюс = пользователь смотрит вверх
   const vertical =
     (v('eyeLookUpLeft') + v('eyeLookUpRight') - v('eyeLookDownLeft') - v('eyeLookDownRight')) / 2;
 
@@ -637,6 +757,7 @@ function applyGaze(faceLost) {
 const worldQ = new THREE.Quaternion();
 const localQ = new THREE.Quaternion();
 const parentQ = new THREE.Quaternion();
+const identityQ = new THREE.Quaternion();
 const tmpEuler = new THREE.Euler();
 const posTarget = new THREE.Vector3();
 
@@ -922,6 +1043,180 @@ function applyArms() {
   applyArm(-1, 11, 13, 15);
 }
 
+// ---------- Кисти и пальцы ----------
+// Индексы точек MediaPipe Hands: 0 запястье, 1-4 большой, 5-8 указательный,
+// 9-12 средний, 13-16 безымянный, 17-20 мизинец
+const FINGERS = [
+  ['Index', 5, 6, 7, 8],
+  ['Middle', 9, 10, 11, 12],
+  ['Ring', 13, 14, 15, 16],
+  ['Little', 17, 18, 19, 20]
+];
+
+const bendA = new THREE.Vector3();
+const bendB = new THREE.Vector3();
+const fingerQ = new THREE.Quaternion();
+const handF = new THREE.Vector3();
+const handS = new THREE.Vector3();
+const handU = new THREE.Vector3();
+const handBasis = new THREE.Matrix4();
+const handDetectedQ = new THREE.Quaternion();
+const handRestQ = new THREE.Quaternion();
+
+// Угол сгиба в точке b между отрезками a-b и b-c (0 = палец прямой)
+function bendAt(a, b, c) {
+  bendA.set(b.x - a.x, b.y - a.y, b.z - a.z);
+  bendB.set(c.x - b.x, c.y - b.y, c.z - b.z);
+  if (bendA.lengthSq() < 1e-10 || bendB.lengthSq() < 1e-10) return 0;
+  return bendA.angleTo(bendB);
+}
+
+function curlAmount(angle, max) {
+  return Math.min(max, deadZone(Math.max(0, angle), FINGER_DEAD) * FINGER_GAIN);
+}
+
+function setFingerBone(name, y, z) {
+  const bone = currentVrm.humanoid.getNormalizedBoneNode(name);
+  if (!bone) return;
+  tmpEuler.set(0, y, z, 'XYZ');
+  fingerQ.setFromEuler(tmpEuler);
+  bone.quaternion.slerp(fingerQ, FINGER_SMOOTH);
+}
+
+// Поворот кисти в мире: по направлению пальцев и плоскости ладони
+function handWorldQuaternion(side, w, out) {
+  setDirection(w[0], w[9], handF);   // от запястья к основанию среднего пальца
+  setDirection(w[5], w[17], handS);  // от указательного к мизинцу
+  if (handF.lengthSq() < 1e-8 || handS.lengthSq() < 1e-8) return false;
+
+  handF.normalize();
+  handS.addScaledVector(handF, -handS.dot(handF));
+  if (handS.lengthSq() < 1e-8) return false;
+  handS.normalize();
+  handU.crossVectors(handS, handF);
+
+  handBasis.makeBasis(handF, handU, handS);
+  handDetectedQ.setFromRotationMatrix(handBasis);
+
+  // Поза покоя: пальцы вдоль руки, ладонь вниз, большой палец вперёд
+  handF.set(side, 0, 0);
+  handS.set(0, 0, -1);
+  handU.crossVectors(handS, handF);
+  handBasis.makeBasis(handF, handU, handS);
+  handRestQ.setFromRotationMatrix(handBasis).invert();
+
+  out.copy(handDetectedQ).multiply(handRestQ);
+  return true;
+}
+
+function applyFingers(side, w) {
+  const prefix = side === 1 ? 'left' : 'right';
+
+  for (const [finger, mcp, pip, dip, tip] of FINGERS) {
+    let p = FINGER_REST;
+    let i = FINGER_REST;
+    let d = FINGER_REST * 0.7;
+
+    if (w) {
+      p = curlAmount(bendAt(w[0], w[mcp], w[pip]), FINGER_MAX.proximal);
+      i = curlAmount(bendAt(w[mcp], w[pip], w[dip]), FINGER_MAX.intermediate);
+      d = curlAmount(bendAt(w[pip], w[dip], w[tip]), FINGER_MAX.distal);
+    }
+
+    setFingerBone(prefix + finger + 'Proximal', 0, -side * p * FINGER_SIGN);
+    setFingerBone(prefix + finger + 'Intermediate', 0, -side * i * FINGER_SIGN);
+    setFingerBone(prefix + finger + 'Distal', 0, -side * d * FINGER_SIGN);
+  }
+
+  // Большой палец: сгибается иначе, поэтому поворот идёт по другой оси (приближённо)
+  let t0 = 0;
+  let t1 = 0;
+  let t2 = 0;
+  if (w) {
+    t0 = curlAmount(bendAt(w[0], w[1], w[2]), 0.7) * 0.6;
+    t1 = curlAmount(bendAt(w[1], w[2], w[3]), 1.0);
+    t2 = curlAmount(bendAt(w[2], w[3], w[4]), 1.2);
+  }
+  setFingerBone(prefix + 'ThumbMetacarpal', side * t0 * THUMB_SIGN, -side * t0 * 0.5 * FINGER_SIGN);
+  setFingerBone(prefix + 'ThumbProximal', side * t1 * THUMB_SIGN, -side * t1 * 0.5 * FINGER_SIGN);
+  setFingerBone(prefix + 'ThumbDistal', side * t2 * THUMB_SIGN, -side * t2 * 0.5 * FINGER_SIGN);
+}
+
+function applyHand(side) {
+  const prefix = side === 1 ? 'left' : 'right';
+  const data = armsOn ? latestHands[prefix] : null;
+  const handBone = currentVrm.humanoid.getNormalizedBoneNode(prefix + 'Hand');
+
+  if (handBone) {
+    if (data && WRIST_ON && handWorldQuaternion(side, data.world, worldQ)) {
+      applyWorldRotation(handBone, worldQ, HAND_SMOOTH);
+    } else {
+      handBone.quaternion.slerp(identityQ, HAND_SMOOTH);
+    }
+  }
+
+  applyFingers(side, data ? data.world : null);
+}
+
+function applyHands() {
+  applyHand(1);
+  applyHand(-1);
+}
+
+function updateHands() {
+  handFrame++;
+  if (handFrame % HAND_EVERY !== 0) return;
+
+  const now = performance.now();
+  const result = handLandmarker.detectForVideo(video, now);
+
+  const found = result.landmarks.map((image, i) => ({
+    image,
+    world: result.worldLandmarks[i]
+  }));
+  found.sort((a, b) => a.image[0].x - b.image[0].x);
+
+  // Левая сторона модели = правая рука человека = левая часть кадра (меньший x)
+  let left = null;
+  let right = null;
+
+  if (found.length >= 2) {
+    left = found[0];
+    right = found[found.length - 1];
+  } else if (found.length === 1) {
+    const hand = found[0];
+    let isLeft = hand.image[0].x < 0.5;
+
+    // Если видно тело, определяем руку по ближайшему запястью
+    if (latestPose) {
+      const pl = latestPose.image[16];
+      const pr = latestPose.image[15];
+      if ((pl.visibility ?? 0) > POSE_VISIBLE && (pr.visibility ?? 0) > POSE_VISIBLE) {
+        const dl = Math.hypot(hand.image[0].x - pl.x, hand.image[0].y - pl.y);
+        const dr = Math.hypot(hand.image[0].x - pr.x, hand.image[0].y - pr.y);
+        isLeft = dl < dr;
+      }
+    }
+
+    if (isLeft) left = hand;
+    else right = hand;
+  }
+
+  if (left) {
+    latestHands.left = { world: smoothLandmarks(left.world, 'hLw', now) };
+  } else {
+    latestHands.left = null;
+    resetFilters('hL');
+  }
+
+  if (right) {
+    latestHands.right = { world: smoothLandmarks(right.world, 'hRw', now) };
+  } else {
+    latestHands.right = null;
+    resetFilters('hR');
+  }
+}
+
 function updatePose() {
   poseFrame++;
   if (poseFrame % POSE_EVERY !== 0) return;
@@ -950,7 +1245,8 @@ function updatePose() {
     latestPose = null;
     latestShoulders = null;
     latestTorso = null;
-    landmarkFilters = {}; // когда тело пропало, фильтры начинают заново
+    resetFilters('i');
+    resetFilters('w');
   }
 }
 
@@ -1019,6 +1315,8 @@ function applyFace(result) {
         .join('\n') +
       '\nпик рта: ' + jawPeak.toFixed(2) +
       '\nтело: ' + (latestPose ? 'видно' : 'не видно') +
+      '\nкисти L/R: ' + (latestHands.left ? 'да' : 'нет') + ' / ' + (latestHands.right ? 'да' : 'нет') +
+      (armsOn ? '' : ' (руки выключены)') +
       '\nраздельные брови: ' + (browSplit ? 'да' : 'нет') +
       '\nуправление взглядом: ' + (currentVrm.lookAt ? 'да' : 'нет') +
       '\nвзгляд yaw/pitch: ' + gaze.yaw.toFixed(0) + ' / ' + gaze.pitch.toFixed(0) +
@@ -1066,6 +1364,11 @@ function animate() {
       updatePose();
     }
 
+    // Кисти считаются только когда включены руки
+    if (armsOn && handLandmarker) {
+      updateHands();
+    }
+
     const result = faceLandmarker.detectForVideo(video, performance.now());
     if (currentVrm && result.faceBlendshapes.length > 0) {
       lastFaceTime = performance.now();
@@ -1091,6 +1394,7 @@ function animate() {
     applyHeadBones(faceLost ? RELAX_SMOOTH : HEAD_SMOOTH);
     applyHeadOffset();
     applyArms();
+    applyHands(); // после рук: кисть крепится к предплечью
     applyGaze(faceLost);
 
     currentVrm.update(delta);
