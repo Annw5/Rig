@@ -49,6 +49,10 @@ const bgButton = document.getElementById('bgButton');
 const armsButton = document.getElementById('bodyButton'); // кнопка рук (руки, кисти, пальцы)
 const panel = document.getElementById('panel');
 
+// Кнопка зеркала создаётся здесь, index.html менять не нужно
+const mirrorButton = document.createElement('button');
+armsButton.insertAdjacentElement('afterend', mirrorButton);
+
 // ---------- Фон ----------
 const BG_MODES = ['dark', 'green', 'transparent'];
 const BG_NAMES = { dark: 'тёмный', green: 'зелёный', transparent: 'прозрачный' };
@@ -152,7 +156,10 @@ const POSE_EVERY = 2;
 // Кисти и пальцы
 const WRIST_ON = true;          // false = кисти не поворачиваются, только пальцы
 const HAND_SMOOTH = 0.3;        // плавность поворота кисти
-const HAND_EVERY = 2;           // трекинг кистей раз в N кадров
+const HAND_EVERY = 3;           // трекинг кистей раз в N кадров
+// Если у кисти видна ладонь вместо тыльной стороны (или наоборот), поменяй true/false
+const HAND_FLIP = { left: true, right: true };
+const HAND_MAX_BEND = 1.7;      // максимум поворота кисти относительно предплечья, радианы
 const FINGER_SIGN = 1;          // если пальцы сгибаются в обратную сторону, поставь -1
 const THUMB_SIGN = 1;           // то же для большого пальца
 const FINGER_GAIN = 1.1;        // сила сгиба
@@ -191,23 +198,66 @@ const FILTER_BETA = 5;
 // Взгляд (зрачки)
 const GAZE_YAW_SIGN = 1;     // если глаза смотрят в другую сторону по горизонтали, поставь -1
 const GAZE_PITCH_SIGN = 1;   // если глаза смотрят в другую сторону по вертикали, поставь -1
-const GAZE_RANGE = { x: 0.6, y: 0.5 };
-const GAZE_DEAD = 0.03;
-const GAZE_MAX = { yaw: 90, pitch: 90 };
+const GAZE_DEAD = { x: 0.03, y: 0.02 };
+const GAZE_MIN_PEAK = { x: 0.2, y: 0.1 };   // минимальный «упор» взгляда, меньше не делим
+const GAZE_MAX_PEAK = { x: 0.8, y: 0.6 };
+const GAZE_PEAK_DECAY = 0.9995;             // как быстро забывается старый максимум
+const GAZE_MAX = { yaw: 90, pitch: 90 };    // градусы на входе lookAt (ход глаз ограничивает сама модель)
 const GAZE_SMOOTH = 0.5;
-const GAZE_FILTER_CUTOFF = 1.0;
+const GAZE_FILTER_CUTOFF = 1.5;
+const GAZE_BLINK_COMP = 0.8;                // взгляд вниз не должен закрывать веки
 const gazeTarget = { yaw: 0, pitch: 0 };
 const gaze = { yaw: 0, pitch: 0 };
+const gazePeaks = { xp: GAZE_MIN_PEAK.x, xn: GAZE_MIN_PEAK.x, yp: GAZE_MIN_PEAK.y, yn: GAZE_MIN_PEAK.y };
 
 // Брови
 const SORROW_GAIN = 0.7;
-const BROW_GAIN = 1.3;
+const BROW_UP_GAIN = 1.3;    // сила подъёма бровей
+const BROW_DOWN_GAIN = 1.8;  // сила опускания (у MediaPipe она обычно слабее)
+const BROW_ASYM = 0.9;       // недоумение: чем выше одна бровь, тем сильнее опускается другая (0 = выключить)
+const BROW_ASYM_DEAD = 0.2;  // насколько бровь должна быть выше, чтобы вторая начала опускаться
 const BROW_MORPHS = ['Fcl_BRW_Surprised', 'Fcl_BRW_Angry', 'Fcl_BRW_Sorrow'];
 const BROW_SEAM = 0.015;
 // Если левая и правая бровь работают наоборот, поставь true
 const BROW_SWAP = false;
 
+// Стороны лица (веки, брови). Если левый глаз модели моргает правым, поставь true
+const FACE_SWAP = false;
+
 let debugCounter = 0;
+let browDebug = { L: [0, 0], R: [0, 0] };
+let trackingErrorShown = false;
+
+// ---------- Зеркало ----------
+// Вкл: модель повторяет твоё отражение (как превью камеры)
+// Выкл: правая рука человека управляет правой рукой модели
+let mirror = localStorage.getItem('mirror') !== '0';
+
+function mir() {
+  return mirror ? 1 : -1;
+}
+
+function updateMirrorButton() {
+  mirrorButton.textContent = 'Зеркало: ' + (mirror ? 'вкл' : 'выкл');
+  video.style.transform = mirror ? 'scaleX(-1)' : 'none';
+}
+updateMirrorButton();
+
+mirrorButton.addEventListener('click', () => {
+  mirror = !mirror;
+  localStorage.setItem('mirror', mirror ? '1' : '0');
+  updateMirrorButton();
+  latestHands = { left: null, right: null };
+  resetFilters('hL');
+  resetFilters('hR');
+});
+
+// Какая сторона лица MediaPipe управляет стороной модели
+function mpSide(modelSide, extraSwap = false) {
+  const flip = (!mirror !== FACE_SWAP) !== extraSwap;
+  if (!flip) return modelSide;
+  return modelSide === 'Left' ? 'Right' : 'Left';
+}
 
 // ---------- Помощники ----------
 function clamp01(value) {
@@ -468,24 +518,33 @@ armsButton.addEventListener('click', async () => {
   }
 });
 
+// Создаёт трекер на GPU, а если не вышло, то на CPU
+async function createTracker(TrackerClass, modelUrl, extra) {
+  for (const delegate of ['GPU', 'CPU']) {
+    try {
+      return await TrackerClass.createFromOptions(visionFileset, {
+        baseOptions: { modelAssetPath: modelUrl, delegate },
+        runningMode: 'VIDEO',
+        ...extra
+      });
+    } catch (error) {
+      console.warn('Трекер не запустился на ' + delegate + ':', error);
+    }
+  }
+  return null;
+}
+
 // Трекинг тела грузится всегда: он нужен для плеч и торса
 async function loadPose() {
   if (!visionFileset || poseLandmarker || poseLoading) return;
 
   poseLoading = true;
-  try {
-    poseLandmarker = await PoseLandmarker.createFromOptions(visionFileset, {
-      baseOptions: {
-        modelAssetPath:
-          'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
-        delegate: 'GPU'
-      },
-      runningMode: 'VIDEO',
-      numPoses: 1
-    });
-  } catch (error) {
-    console.error('Не удалось запустить трекинг тела:', error);
-  }
+  poseLandmarker = await createTracker(
+    PoseLandmarker,
+    'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+    { numPoses: 1 }
+  );
+  if (!poseLandmarker) console.error('Не удалось запустить трекинг тела');
   poseLoading = false;
 }
 
@@ -494,23 +553,14 @@ async function loadHands() {
   if (!visionFileset || handLandmarker || handLoading) return;
 
   handLoading = true;
-  const oldText = armsButton.textContent;
   armsButton.textContent = 'Загрузка кистей...';
-  try {
-    handLandmarker = await HandLandmarker.createFromOptions(visionFileset, {
-      baseOptions: {
-        modelAssetPath:
-          'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
-        delegate: 'GPU'
-      },
-      runningMode: 'VIDEO',
-      numHands: 2
-    });
-  } catch (error) {
-    console.error('Не удалось запустить трекинг кистей:', error);
-  }
+  handLandmarker = await createTracker(
+    HandLandmarker,
+    'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+    { numHands: 2 }
+  );
+  if (!handLandmarker) console.error('Не удалось запустить трекинг кистей');
   handLoading = false;
-  armsButton.textContent = oldText;
   updateArmsButton();
 }
 
@@ -581,22 +631,20 @@ async function startTracking() {
     video.srcObject = stream;
     await video.play();
 
-    const fileset = await FilesetResolver.forVisionTasks(
+    visionFileset = await FilesetResolver.forVisionTasks(
       'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
     );
-    visionFileset = fileset;
 
-    faceLandmarker = await FaceLandmarker.createFromOptions(fileset, {
-      baseOptions: {
-        modelAssetPath:
-          'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
-        delegate: 'GPU'
-      },
-      runningMode: 'VIDEO',
-      numFaces: 1,
-      outputFaceBlendshapes: true,
-      outputFacialTransformationMatrixes: true
-    });
+    faceLandmarker = await createTracker(
+      FaceLandmarker,
+      'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+      {
+        numFaces: 1,
+        outputFaceBlendshapes: true,
+        outputFacialTransformationMatrixes: true
+      }
+    );
+    if (!faceLandmarker) throw new Error('Не удалось запустить трекинг лица');
 
     cameraButton.textContent = 'Камера включена';
 
@@ -627,6 +675,8 @@ resetButton.addEventListener('click', () => {
   neutral = {};
   base = {};
   localStorage.removeItem('neutral');
+  gazePeaks.xp = gazePeaks.xn = GAZE_MIN_PEAK.x;
+  gazePeaks.yp = gazePeaks.yn = GAZE_MIN_PEAK.y;
 });
 
 // ---------- Выражения ----------
@@ -691,34 +741,56 @@ function applyBrows(shapes) {
     return;
   }
 
-  const outerLeft = level(shapes, 'browOuterUpLeft', RANGE.brow);
-  const outerRight = level(shapes, 'browOuterUpRight', RANGE.brow);
-  const downLeft = level(shapes, 'browDownLeft', RANGE.brow);
-  const downRight = level(shapes, 'browDownRight', RANGE.brow);
+  // Сначала считаем подъём и опускание каждой брови отдельно
+  const sides = {};
+  for (const modelSide of ['Left', 'Right']) {
+    const mp = mpSide(modelSide, BROW_SWAP);
+    sides[modelSide] = {
+      up: clamp01(level(shapes, 'browOuterUp' + mp, RANGE.brow) * BROW_UP_GAIN),
+      down: clamp01(level(shapes, 'browDown' + mp, RANGE.brow) * BROW_DOWN_GAIN)
+    };
+  }
 
-  // Ложная «грусть» на одной брови, когда другая поднята, не нужна
-  const maxOuter = Math.max(outerLeft, outerRight);
-  const sorrowBase = clamp01((innerUp - maxOuter) * SORROW_GAIN);
+  // Ложная «грусть», когда одна бровь поднята, не нужна
+  const maxUp = Math.max(sides.Left.up, sides.Right.up);
+  const sorrowBase = clamp01((innerUp - maxUp) * SORROW_GAIN);
 
-  const sides = [
-    [BROW_SWAP ? '_R' : '_L', outerLeft, downLeft],
-    [BROW_SWAP ? '_L' : '_R', outerRight, downRight]
-  ];
+  for (const modelSide of ['Left', 'Right']) {
+    const mine = sides[modelSide];
+    const other = sides[modelSide === 'Left' ? 'Right' : 'Left'];
 
-  for (const [suffix, outer, down] of sides) {
+    // Недоумение: если другая бровь заметно выше, эта опускается
+    const asym = Math.max(0, other.up - mine.up - BROW_ASYM_DEAD) * BROW_ASYM;
+    const down = clamp01(Math.max(mine.down, asym));
+
     // Вверх и вниз на одной брови не работают одновременно: побеждает сильнее
-    const net = clamp01(outer * BROW_GAIN) - clamp01(down * BROW_GAIN);
+    const net = mine.up - down;
     const up = Math.max(0, net);
     const frown = Math.max(0, -net);
     const sorrow = sorrowBase * (1 - frown);
 
+    const suffix = modelSide === 'Left' ? '_L' : '_R';
     setMorphSmooth('Fcl_BRW_Surprised' + suffix, up);
     setMorphSmooth('Fcl_BRW_Angry' + suffix, frown);
     setMorphSmooth('Fcl_BRW_Sorrow' + suffix, sorrow);
+
+    browDebug[modelSide === 'Left' ? 'L' : 'R'] = [up, frown];
   }
 }
 
 // ---------- Взгляд (зрачки) ----------
+// Для каждого из четырёх направлений диапазон подстраивается сам:
+// вверх у MediaPipe значения заметно меньше, чем вправо или влево
+function normGaze(value, axis) {
+  const key = axis + (value >= 0 ? 'p' : 'n');
+  const decayed = gazePeaks[key] * GAZE_PEAK_DECAY;
+  gazePeaks[key] = Math.min(
+    GAZE_MAX_PEAK[axis],
+    Math.max(Math.abs(value), decayed, GAZE_MIN_PEAK[axis])
+  );
+  return limit(value / gazePeaks[key], 1);
+}
+
 function updateGazeTarget(shapes, time) {
   const v = (name) => (shapes[name] ?? 0) - (neutral[name] ?? 0);
 
@@ -727,13 +799,13 @@ function updateGazeTarget(shapes, time) {
   const vertical =
     (v('eyeLookUpLeft') + v('eyeLookUpRight') - v('eyeLookDownLeft') - v('eyeLookDownRight')) / 2;
 
-  const hx = gazeFilterX.filter(horizontal, time);
-  const hy = gazeFilterY.filter(vertical, time);
+  const hx = deadZone(gazeFilterX.filter(horizontal, time), GAZE_DEAD.x);
+  const hy = deadZone(gazeFilterY.filter(vertical, time), GAZE_DEAD.y);
 
-  const nx = limit(deadZone(hx, GAZE_DEAD) / GAZE_RANGE.x, 1);
-  const ny = limit(deadZone(hy, GAZE_DEAD) / GAZE_RANGE.y, 1);
+  const nx = normGaze(hx, 'x');
+  const ny = normGaze(hy, 'y');
 
-  gazeTarget.yaw = nx * GAZE_MAX.yaw * GAZE_YAW_SIGN;
+  gazeTarget.yaw = nx * GAZE_MAX.yaw * GAZE_YAW_SIGN * mir();
   gazeTarget.pitch = ny * GAZE_MAX.pitch * GAZE_PITCH_SIGN;
 }
 
@@ -761,12 +833,18 @@ const identityQ = new THREE.Quaternion();
 const tmpEuler = new THREE.Euler();
 const posTarget = new THREE.Vector3();
 
+function isFiniteQuaternion(q) {
+  return Number.isFinite(q.x + q.y + q.z + q.w);
+}
+
 // Кость поворачивается так, как задано в мире, а программа сама учитывает
 // повороты всех родителей (позвоночник, грудь, плечо...)
 function applyWorldRotation(bone, qWorld, smooth) {
   if (!bone || !bone.parent) return;
+  if (!isFiniteQuaternion(qWorld)) return;
   bone.parent.getWorldQuaternion(parentQ);
   localQ.copy(parentQ).invert().multiply(qWorld).multiply(currentVrm.scene.quaternion);
+  if (!isFiniteQuaternion(localQ)) return;
   bone.quaternion.slerp(localQ, smooth);
 }
 
@@ -820,9 +898,9 @@ function updateHeadTarget(shapes) {
     return;
   }
 
-  headTarget.yaw = limit(rawYaw * YAW_SIGN, MAX_ANGLE.yaw);
+  headTarget.yaw = limit(rawYaw * YAW_SIGN * mir(), MAX_ANGLE.yaw);
   headTarget.pitch = limit(rawPitch * PITCH_SIGN, MAX_ANGLE.pitch);
-  headTarget.roll = limit(rawRoll * ROLL_SIGN, MAX_ANGLE.roll);
+  headTarget.roll = limit(rawRoll * ROLL_SIGN * mir(), MAX_ANGLE.roll);
 }
 
 function applyHeadBones(smooth) {
@@ -850,7 +928,7 @@ function updateHeadOffset(shapes) {
   base.headY ??= shapes.headY;
   base.headZ ??= shapes.headZ;
 
-  headOffset.x = limit((shapes.headX - base.headX) * HEAD_POS_SIGN.x * HEAD_POS_GAIN.x, HEAD_POS_MAX.x);
+  headOffset.x = limit((shapes.headX - base.headX) * HEAD_POS_SIGN.x * mir() * HEAD_POS_GAIN.x, HEAD_POS_MAX.x);
   headOffset.y = limit((shapes.headY - base.headY) * HEAD_POS_SIGN.y * HEAD_POS_GAIN.y, HEAD_POS_MAX.y);
   headOffset.z = limit((shapes.headZ - base.headZ) * HEAD_POS_SIGN.z * HEAD_POS_GAIN.z, HEAD_POS_MAX.z);
 }
@@ -887,8 +965,8 @@ function updateTorsoTarget() {
   if (latestTorso && base.torsoRoll !== undefined && base.torsoYaw !== undefined) {
     const roll = deadZone(latestTorso.roll - base.torsoRoll, TORSO_DEAD);
     const yaw = deadZone(latestTorso.yaw - base.torsoYaw, TORSO_DEAD);
-    torso.roll = limit(roll * TORSO_ROLL_SIGN, TORSO_MAX.roll);
-    torso.yaw = limit(yaw * TORSO_YAW_SIGN, TORSO_MAX.yaw);
+    torso.roll = limit(roll * TORSO_ROLL_SIGN * mir(), TORSO_MAX.roll);
+    torso.yaw = limit(yaw * TORSO_YAW_SIGN * mir(), TORSO_MAX.yaw);
   }
 }
 
@@ -964,10 +1042,24 @@ function applyShoulder(side, boneName, gap, baseGap, depth, baseDepth) {
   offsetBone(boneName, 0, 0, dz);
 }
 
+// Какое плечо человека ('left' или 'right') управляет плечом модели
+function shoulderSource(modelSide) {
+  const isLeft = modelSide === 'left';
+  return (mirror ? !isLeft : isLeft) ? 'left' : 'right';
+}
+
 function applyShoulders() {
   const s = latestShoulders;
-  applyShoulder(1, 'leftShoulder', s?.right, base.gapRight, s?.depthRight, base.depthRight);
-  applyShoulder(-1, 'rightShoulder', s?.left, base.gapLeft, s?.depthLeft, base.depthLeft);
+  const list = [
+    [1, 'leftShoulder', 'left'],
+    [-1, 'rightShoulder', 'right']
+  ];
+
+  for (const [side, boneName, modelSide] of list) {
+    const src = shoulderSource(modelSide);
+    const K = src === 'left' ? 'Left' : 'Right';
+    applyShoulder(side, boneName, s?.[src], base['gap' + K], s?.['depth' + K], base['depth' + K]);
+  }
 }
 
 // ---------- Руки ----------
@@ -980,7 +1072,7 @@ const lowerQ = new THREE.Quaternion();
 
 function setDirection(from, to, target) {
   target.set(
-    (to.x - from.x) * ARM_SIGN.x,
+    (to.x - from.x) * ARM_SIGN.x * mir(),
     (to.y - from.y) * ARM_SIGN.y,
     (to.z - from.z) * ARM_SIGN.z
   );
@@ -1039,8 +1131,15 @@ function applyArm(side, shoulderId, elbowId, wristId) {
 }
 
 function applyArms() {
-  applyArm(1, 12, 14, 16);
-  applyArm(-1, 11, 13, 15);
+  if (mirror) {
+    // Левая рука модели повторяет правую руку человека (как отражение)
+    applyArm(1, 12, 14, 16);
+    applyArm(-1, 11, 13, 15);
+  } else {
+    // Левая рука модели повторяет левую руку человека
+    applyArm(1, 11, 13, 15);
+    applyArm(-1, 12, 14, 16);
+  }
 }
 
 // ---------- Кисти и пальцы ----------
@@ -1062,6 +1161,10 @@ const handU = new THREE.Vector3();
 const handBasis = new THREE.Matrix4();
 const handDetectedQ = new THREE.Quaternion();
 const handRestQ = new THREE.Quaternion();
+const forearmQ = new THREE.Quaternion();
+const sceneInvQ = new THREE.Quaternion();
+const handRelQ = new THREE.Quaternion();
+const handLimitQ = new THREE.Quaternion();
 
 // Угол сгиба в точке b между отрезками a-b и b-c (0 = палец прямой)
 function bendAt(a, b, c) {
@@ -1093,6 +1196,10 @@ function handWorldQuaternion(side, w, out) {
   handS.addScaledVector(handF, -handS.dot(handF));
   if (handS.lengthSq() < 1e-8) return false;
   handS.normalize();
+
+  // Разворот на 180° вокруг оси пальцев: ладонь и тыльная сторона меняются местами
+  if (HAND_FLIP[side === 1 ? 'left' : 'right']) handS.negate();
+
   handU.crossVectors(handS, handF);
 
   handBasis.makeBasis(handF, handU, handS);
@@ -1107,6 +1214,26 @@ function handWorldQuaternion(side, w, out) {
 
   out.copy(handDetectedQ).multiply(handRestQ);
   return true;
+}
+
+// Кисть не может поворачиваться относительно предплечья больше HAND_MAX_BEND
+function limitToForearm(lowerBone, qHand) {
+  lowerBone.getWorldQuaternion(forearmQ);
+  sceneInvQ.copy(currentVrm.scene.quaternion).invert();
+  forearmQ.multiply(sceneInvQ); // поворот предплечья относительно позы покоя
+
+  handRelQ.copy(forearmQ).invert().multiply(qHand);
+  if (handRelQ.w < 0) {
+    handRelQ.set(-handRelQ.x, -handRelQ.y, -handRelQ.z, -handRelQ.w);
+  }
+
+  const angle = 2 * Math.acos(Math.min(1, handRelQ.w));
+  if (angle > HAND_MAX_BEND) {
+    handLimitQ.identity().slerp(handRelQ, HAND_MAX_BEND / angle);
+    handRelQ.copy(handLimitQ);
+  }
+
+  qHand.copy(forearmQ).multiply(handRelQ);
 }
 
 function applyFingers(side, w) {
@@ -1145,10 +1272,13 @@ function applyFingers(side, w) {
 function applyHand(side) {
   const prefix = side === 1 ? 'left' : 'right';
   const data = armsOn ? latestHands[prefix] : null;
-  const handBone = currentVrm.humanoid.getNormalizedBoneNode(prefix + 'Hand');
+  const humanoid = currentVrm.humanoid;
+  const handBone = humanoid.getNormalizedBoneNode(prefix + 'Hand');
+  const lowerBone = humanoid.getNormalizedBoneNode(prefix + 'LowerArm');
 
   if (handBone) {
-    if (data && WRIST_ON && handWorldQuaternion(side, data.world, worldQ)) {
+    if (data && WRIST_ON && lowerBone && handWorldQuaternion(side, data.world, worldQ)) {
+      limitToForearm(lowerBone, worldQ);
       applyWorldRotation(handBone, worldQ, HAND_SMOOTH);
     } else {
       handBone.quaternion.slerp(identityQ, HAND_SMOOTH);
@@ -1174,31 +1304,35 @@ function updateHands() {
     image,
     world: result.worldLandmarks[i]
   }));
+  // По горизонтали кадра: первая рука слева в кадре (это правая рука человека)
   found.sort((a, b) => a.image[0].x - b.image[0].x);
 
-  // Левая сторона модели = правая рука человека = левая часть кадра (меньший x)
   let left = null;
   let right = null;
 
   if (found.length >= 2) {
-    left = found[0];
-    right = found[found.length - 1];
+    const first = found[0];
+    const last = found[found.length - 1];
+    // Зеркало вкл: рука слева в кадре управляет ЛЕВОЙ рукой модели
+    left = mirror ? first : last;
+    right = mirror ? last : first;
   } else if (found.length === 1) {
     const hand = found[0];
-    let isLeft = hand.image[0].x < 0.5;
+    let onImageLeft = hand.image[0].x < 0.5;
 
     // Если видно тело, определяем руку по ближайшему запястью
     if (latestPose) {
-      const pl = latestPose.image[16];
-      const pr = latestPose.image[15];
-      if ((pl.visibility ?? 0) > POSE_VISIBLE && (pr.visibility ?? 0) > POSE_VISIBLE) {
-        const dl = Math.hypot(hand.image[0].x - pl.x, hand.image[0].y - pl.y);
-        const dr = Math.hypot(hand.image[0].x - pr.x, hand.image[0].y - pr.y);
-        isLeft = dl < dr;
+      const wristImageLeft = latestPose.image[16];  // правое запястье человека (слева в кадре)
+      const wristImageRight = latestPose.image[15]; // левое запястье человека (справа в кадре)
+      if ((wristImageLeft.visibility ?? 0) > POSE_VISIBLE && (wristImageRight.visibility ?? 0) > POSE_VISIBLE) {
+        const d1 = Math.hypot(hand.image[0].x - wristImageLeft.x, hand.image[0].y - wristImageLeft.y);
+        const d2 = Math.hypot(hand.image[0].x - wristImageRight.x, hand.image[0].y - wristImageRight.y);
+        onImageLeft = d1 < d2;
       }
     }
 
-    if (isLeft) left = hand;
+    const isModelLeft = mirror ? onImageLeft : !onImageLeft;
+    if (isModelLeft) left = hand;
     else right = hand;
   }
 
@@ -1314,12 +1448,17 @@ function applyFace(result) {
         .map((n) => n + ': сейчас ' + (shapes[n] ?? 0).toFixed(2) + ', покой ' + (neutral[n] ?? 0).toFixed(2))
         .join('\n') +
       '\nпик рта: ' + jawPeak.toFixed(2) +
+      '\nзеркало: ' + (mirror ? 'вкл' : 'выкл') +
       '\nтело: ' + (latestPose ? 'видно' : 'не видно') +
       '\nкисти L/R: ' + (latestHands.left ? 'да' : 'нет') + ' / ' + (latestHands.right ? 'да' : 'нет') +
       (armsOn ? '' : ' (руки выключены)') +
       '\nраздельные брови: ' + (browSplit ? 'да' : 'нет') +
+      '\nброви L (вверх/вниз): ' + fmt(browDebug.L[0]) + ' / ' + fmt(browDebug.L[1]) +
+      '\nброви R (вверх/вниз): ' + fmt(browDebug.R[0]) + ' / ' + fmt(browDebug.R[1]) +
       '\nуправление взглядом: ' + (currentVrm.lookAt ? 'да' : 'нет') +
       '\nвзгляд yaw/pitch: ' + gaze.yaw.toFixed(0) + ' / ' + gaze.pitch.toFixed(0) +
+      '\nпики взгляда x+/x-/y+/y-: ' + gazePeaks.xp.toFixed(2) + ' / ' + gazePeaks.xn.toFixed(2) +
+      ' / ' + gazePeaks.yp.toFixed(2) + ' / ' + gazePeaks.yn.toFixed(2) +
       '\nкостей торса: ' + torsoBones.length +
       '\nдистанция: ' + (shapes.headZ ?? 0).toFixed(1) + ' см' +
       '\nплечи зазор L/R: ' + fmt(latestShoulders?.left) + ' / ' + fmt(latestShoulders?.right) +
@@ -1329,8 +1468,18 @@ function applyFace(result) {
       ' (покой ' + fmt(base.torsoRoll) + ' / ' + fmt(base.torsoYaw) + ')';
   }
 
-  setSmooth('blinkLeft', level(shapes, 'eyeBlinkLeft', RANGE.blink));
-  setSmooth('blinkRight', level(shapes, 'eyeBlinkRight', RANGE.blink));
+  // Моргание: взгляд вниз тянет веки вниз, это не моргание
+  const adjusted = { ...shapes };
+  for (const mp of ['Left', 'Right']) {
+    const down = Math.max(
+      0,
+      (shapes['eyeLookDown' + mp] ?? 0) - (neutral['eyeLookDown' + mp] ?? 0)
+    );
+    adjusted['eyeBlink' + mp] = (shapes['eyeBlink' + mp] ?? 0) - GAZE_BLINK_COMP * down;
+  }
+
+  setSmooth('blinkLeft', level(adjusted, 'eyeBlink' + mpSide('Left'), RANGE.blink));
+  setSmooth('blinkRight', level(adjusted, 'eyeBlink' + mpSide('Right'), RANGE.blink));
   setSmooth('aa', jawLevel(shapes));
   setSmooth('ou', level(shapes, 'mouthPucker', RANGE.pucker));
 
@@ -1352,27 +1501,38 @@ function applyFace(result) {
 const clock = new THREE.Clock();
 let lastVideoTime = -1;
 
+function trackFrame() {
+  if (!(faceLandmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime)) return;
+  lastVideoTime = video.currentTime;
+
+  // Сначала тело, чтобы плечи и торс были свежими, когда считается лицо
+  if (poseLandmarker) {
+    updatePose();
+  }
+
+  // Кисти считаются только когда включены руки
+  if (armsOn && handLandmarker) {
+    updateHands();
+  }
+
+  const result = faceLandmarker.detectForVideo(video, performance.now());
+  if (currentVrm && result.faceBlendshapes.length > 0) {
+    lastFaceTime = performance.now();
+    applyFace(result);
+  }
+}
+
 function animate() {
   requestAnimationFrame(animate);
   const delta = clock.getDelta();
 
-  if (faceLandmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
-    lastVideoTime = video.currentTime;
-
-    // Сначала тело, чтобы плечи и торс были свежими, когда считается лицо
-    if (poseLandmarker) {
-      updatePose();
-    }
-
-    // Кисти считаются только когда включены руки
-    if (armsOn && handLandmarker) {
-      updateHands();
-    }
-
-    const result = faceLandmarker.detectForVideo(video, performance.now());
-    if (currentVrm && result.faceBlendshapes.length > 0) {
-      lastFaceTime = performance.now();
-      applyFace(result);
+  // Ошибка трекинга не должна останавливать модель
+  try {
+    trackFrame();
+  } catch (error) {
+    if (!trackingErrorShown) {
+      console.error('Ошибка трекинга:', error);
+      trackingErrorShown = true;
     }
   }
 
