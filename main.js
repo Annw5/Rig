@@ -3,6 +3,38 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 import { FaceLandmarker, PoseLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
 
+async function openCamera() {
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const modes = [
+    { width: { ideal: 1280 }, height: { ideal: 720 } },
+    { width: { ideal: 640 }, height: { ideal: 480 } },
+    {}
+  ];
+  let last;
+  for (let round = 0; round < 2; round++) {
+    // Сначала камера по умолчанию, потом каждая найденная по очереди
+    let ids = [undefined];
+    try {
+      const list = await navigator.mediaDevices.enumerateDevices();
+      ids = ids.concat(list.filter((d) => d.kind === 'videoinput' && d.deviceId).map((d) => d.deviceId));
+    } catch {}
+    for (const id of ids) {
+      for (const mode of modes) {
+        try {
+          return await navigator.mediaDevices.getUserMedia({
+            video: id ? { ...mode, deviceId: { exact: id } } : mode
+          });
+        } catch (e) {
+          last = e;
+          if (e.name === 'NotAllowedError' || e.name === 'SecurityError') throw e;
+        }
+      }
+    }
+    await wait(1500); // даём браузеру освободить камеру и пробуем ещё раз
+  }
+  throw last;
+}
+
 // ======================= НАСТРОЙКИ =======================
 // Если что-то двигается наоборот, меняй знаки (1 и -1) здесь
 
