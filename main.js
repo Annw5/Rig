@@ -245,7 +245,7 @@ function steer(node, qWorld, smooth) {
 // ======================= КАМЕРА И ТРЕКЕРЫ =======================
 const MODELS = 'https://storage.googleapis.com/mediapipe-models/';
 let faceTracker = null, poseTracker = null, fileset = null, poseLoading = false;
-let pose = null, body = null, poseFrame = 0;
+let pose = null, body = null, poseFrame = 0, lastTrackerError = null;
 
 // Создаёт трекер на видеокарте, а если не вышло, то на процессоре
 async function createTracker(Cls, modelPath, extra) {
@@ -257,6 +257,7 @@ async function createTracker(Cls, modelPath, extra) {
         ...extra
       });
     } catch (error) {
+      lastTrackerError = error;
       console.warn('Трекер не запустился на ' + delegate, error);
     }
   }
@@ -281,8 +282,6 @@ function unloadPose() {
   poseTracker = null;
   pose = body = null;
 }
-
-cameraButton.onclick = async () => {
 
 function stopCamera() {
   video.srcObject?.getTracks().forEach((t) => t.stop());
@@ -331,32 +330,48 @@ const CAMERA_ERRORS = {
   NotFoundError: 'Камера не найдена. Проверь, что она подключена.',
   OverconstrainedError: 'Камера не найдена. Проверь, что она подключена.'
 };
-  
+
+cameraButton.onclick = async () => {
+  let stage = 'включение камеры';
   try {
     cameraButton.disabled = true;
     cameraButton.textContent = 'Загрузка...';
-    video.srcObject = await navigator.mediaDevices.getUserMedia({
-      video: { width: 1280, height: 720, frameRate: 60 }
-    });
+
+    stopCamera();
+    video.srcObject = await openCamera();
+
+    stage = 'запуск видео';
     await video.play();
 
+    stage = 'загрузка файлов трекинга';
     fileset = await FilesetResolver.forVisionTasks(
       'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
     );
+
+    stage = 'запуск трекера лица';
     faceTracker = await createTracker(
       FaceLandmarker,
       'face_landmarker/face_landmarker/float16/1/face_landmarker.task',
       { numFaces: 1, outputFaceBlendshapes: true, outputFacialTransformationMatrixes: true }
     );
-    if (!faceTracker) throw new Error('Не удалось запустить трекинг лица');
+    if (!faceTracker) {
+      throw new Error('трекер лица не запустился ни на видеокарте, ни на процессоре: ' + lastTrackerError?.message);
+    }
 
     cameraButton.textContent = 'Камера включена';
+
+    stage = 'запуск трекера тела';
     if (bodyOn) await loadPose();
   } catch (error) {
-    console.error(error);
-    alert('Не получилось включить камеру или трекинг. Подробности в консоли (F12).');
+    console.error('Этап: ' + stage, error);
+    stopCamera();
     cameraButton.disabled = false;
     cameraButton.textContent = 'Включить камеру';
+    alert(
+      (CAMERA_ERRORS[error?.name] ?? 'Не получилось включить камеру или трекинг.') +
+      '\n\nЭтап: ' + stage +
+      '\nПричина: ' + (error?.name ?? '') + ' ' + (error?.message ?? '')
+    );
   }
 };
 
