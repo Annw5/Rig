@@ -283,6 +283,55 @@ function unloadPose() {
 }
 
 cameraButton.onclick = async () => {
+
+function stopCamera() {
+  video.srcObject?.getTracks().forEach((t) => t.stop());
+  video.srcObject = null;
+}
+
+// Пробует режимы и все найденные камеры, при неудаче ждёт и повторяет
+async function openCamera() {
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const modes = [
+    { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60 } },
+    { width: { ideal: 640 }, height: { ideal: 480 } },
+    {}
+  ];
+
+  let lastError;
+  for (let round = 0; round < 2; round++) {
+    let ids = [undefined];
+    try {
+      const list = await navigator.mediaDevices.enumerateDevices();
+      ids = ids.concat(list.filter((d) => d.kind === 'videoinput' && d.deviceId).map((d) => d.deviceId));
+    } catch {}
+
+    for (const id of ids) {
+      for (const mode of modes) {
+        try {
+          return await navigator.mediaDevices.getUserMedia({
+            video: id ? { ...mode, deviceId: { exact: id } } : mode
+          });
+        } catch (error) {
+          lastError = error;
+          if (error.name === 'NotAllowedError' || error.name === 'SecurityError') throw error;
+        }
+      }
+    }
+    await wait(1500);
+  }
+  throw lastError;
+}
+
+const CAMERA_ERRORS = {
+  NotReadableError: 'Камеру, скорее всего, занимает другое приложение или вкладка (OBS, Zoom, Discord, Telegram). Закрой их, перезагрузи страницу и нажми кнопку ещё раз.',
+  AbortError: 'Камеру, скорее всего, занимает другое приложение или вкладка. Закрой их и нажми кнопку ещё раз.',
+  NotAllowedError: 'Нет доступа к камере. Разреши её для этого сайта (значок замка у адреса) и перезагрузи страницу.',
+  SecurityError: 'Нет доступа к камере. Разреши её для этого сайта и перезагрузи страницу.',
+  NotFoundError: 'Камера не найдена. Проверь, что она подключена.',
+  OverconstrainedError: 'Камера не найдена. Проверь, что она подключена.'
+};
+  
   try {
     cameraButton.disabled = true;
     cameraButton.textContent = 'Загрузка...';
