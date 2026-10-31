@@ -12,6 +12,8 @@ const MAX_ANGLE = { yaw: 1.0, pitch: 0.8, roll: 0.7 };
 const MAX_VALID = { yaw: 1.4, pitch: 1.1, roll: 1.0 };
 const NECK_SHARE = 0.3, HEAD_SMOOTH = 0.4, LOST_SMOOTH = 0.05, LOST_DELAY = 400;
 
+const GAZE = { yaw: -100, pitch: 80 };   // взгляд. Плохо реагирует: увеличь. Идёт не туда: смени знак
+
 const POS_SIGN = { x: -1, y: 1, z: 1 };
 const POS_GAIN = { x: 0.012, y: 0.012, z: 0.03 };
 const POS_MAX = { x: 0.6, y: 0.4, z: 1.2 };
@@ -30,6 +32,10 @@ const TORSO_SMOOTH = 0.2;
 
 const RANGE = { pucker: 0.5, smile: 0.5, brow: 0.5 };
 const DEAD = 0.08, SORROW_GAIN = 1, BLINK_MAX_BASE = 0.25, BLINK_LOOKDOWN = 0.8, JAW_MAX_BASE = 0.03;
+
+// Пальцы: название, номер первой точки руки, названия суставов
+const P = ['Proximal', 'Intermediate', 'Distal'];
+const FINGERS = [['Thumb', 1, ['Metacarpal', 'Proximal', 'Distal']], ['Index', 5, P], ['Middle', 9, P], ['Ring', 13, P], ['Little', 17, P]];
 
 // Значения тела не сохраняются между запусками
 const BODY_KEYS = ['headX', 'headY', 'headZ', 'gapLeft', 'gapRight', 'torsoRoll', 'torsoYaw'];
@@ -197,13 +203,19 @@ $('fileInput').onchange = (e) => {
     scene.add(vrm.scene);
     URL.revokeObjectURL(url);
 
-    exprBox.textContent = 'Выражения модели: ' + Object.keys(vrm.expressionManager.expressionMap).join(', ');
     faceMeshes = [];
     vrm.scene.traverse((o) => {
       if (o.isMesh && o.morphTargetDictionary?.Fcl_MTH_Joy !== undefined) faceMeshes.push(o);
     });
-    torsoBones = ['spine', 'chest', 'upperChest'].map((n) => vrm.humanoid.getNormalizedBoneNode(n)).filter(Boolean);
-    console.log('Кусков лица:', faceMeshes.length, 'Костей корпуса:', torsoBones.length, 'VRM', vrm.meta.metaVersion);
+    torsoBones = ['spine', 'chest', 'upperChest'].map(bone).filter(Boolean);
+
+    // Диагностика модели
+    const fingers = ['left', 'right']
+      .flatMap((s) => FINGERS.flatMap(([f, , parts]) => parts.map((p) => s + f + p)))
+      .filter(bone).length;
+    exprBox.textContent =
+      'Кости пальцев: ' + fingers + ' из 30\nВзгляд: ' + (vrm.lookAt ? 'есть' : 'нет в модели') +
+      '\nVRM ' + vrm.meta.metaVersion + ', кусков лица: ' + faceMeshes.length;
   }, undefined, (error) => {
     console.error(error);
     alert('Не удалось загрузить модель. Это точно файл .vrm?');
@@ -244,11 +256,11 @@ const localQ = new THREE.Quaternion(), parentQ = new THREE.Quaternion();
 const rot = (x, y, z) => worldQ.setFromEuler(euler.set(x, y, z, 'YXZ'));
 
 // Поворот задан в мире, повороты родителей учитываются сами
-function steer(node, qWorld, smooth) {
+function steer(node, qWorld, smoothing) {
   if (!node?.parent) return;
   node.parent.getWorldQuaternion(parentQ);
   localQ.copy(parentQ).invert().multiply(qWorld).multiply(vrm.scene.quaternion);
-  node.quaternion.slerp(localQ, smooth);
+  node.quaternion.slerp(localQ, smoothing);
 }
 
 // ======================= КАМЕРА И ТРЕКЕРЫ =======================
@@ -278,7 +290,8 @@ async function loadPose() {
   poseLoading = true;
   bodyButton.textContent = 'Загрузка тела...';
   poseTracker = await createTracker(PoseLandmarker, 'pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task', { numPoses: 1 });
-  handTracker = await createTracker(HandLandmarker, 'hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task', { numHands: 2 });
+  handTracker = await createTracker(HandLandmarker, 'hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+    { numHands: 2, minHandDetectionConfidence: 0.3, minHandPresenceConfidence: 0.3, minTrackingConfidence: 0.3 });
   poseLoading = false;
   updateBodyButton();
 }
@@ -439,13 +452,13 @@ function readBody() {
 function updatePose() {
   if (++poseFrame % POSE_EVERY !== 0) return;
   const now = performance.now(), t = now / 1000;
-  const r = poseTracker.detectForVideo(video, now);
+  const r = poseTracker?.detectForVideo(video, now);
   const h = handTracker?.detectForVideo(video, now);
 
   hands = {};
   h?.worldLandmarks.forEach((lm, i) => { hands[h.handedness[i][0].categoryName] = lm; });
 
-  if (r.landmarks.length && r.worldLandmarks.length) {
+  if (r?.landmarks.length && r.worldLandmarks.length) {
     pose = { image: r.landmarks[0], world: r.worldLandmarks[0] };
     for (const i of [11, 12, 13, 14, 15, 16]) for (const a of 'xyz') pose.world[i][a] = smooth(i + a, pose.world[i][a], t);
     body = readBody();
@@ -510,8 +523,6 @@ function applyArm({ side, upper, lower, ids: [s, e, w] }) {
 }
 
 // Пальцы: сгиб каждого сустава равен углу между соседними отрезками пальца
-const P = ['Proximal', 'Intermediate', 'Distal'];
-const FINGERS = [['Thumb', 1, ['Metacarpal', 'Proximal', 'Distal']], ['Index', 5, P], ['Middle', 9, P], ['Ring', 13, P], ['Little', 17, P]];
 const va = new THREE.Vector3(), vb = new THREE.Vector3();
 const seg = (lm, p, k, v) => v.set(lm[p[k + 1]].x - lm[p[k]].x, lm[p[k + 1]].y - lm[p[k]].y, lm[p[k + 1]].z - lm[p[k]].z);
 
@@ -559,7 +570,8 @@ function applyFace(result) {
       '\nпик моргания L/R: ' + fmt(blinkRanges.Left.peak) + ' / ' + fmt(blinkRanges.Right.peak) +
       '\nпик рта: ' + fmt(jawRange.peak) +
       '\nдистанция: ' + fmt(shapes.headZ) + ' см' +
-      '\nтело: ' + (body ? 'видно' : 'не видно') + ', кисти: ' + (Object.keys(hands).join(' ') || 'нет') +
+      '\nтело: ' + (body ? 'видно' : 'не видно') +
+      '\nкисти: ' + (handTracker ? Object.keys(hands).join(' ') || 'не вижу' : 'трекер не запущен') +
       '\nплечи зазор L/R: ' + fmt(body?.gapLeft) + ' / ' + fmt(body?.gapRight) +
       ' (покой ' + fmt(neutral.gapLeft) + ' / ' + fmt(neutral.gapRight) + ')' +
       '\nкорпус наклон/поворот: ' + fmt(body?.torsoRoll) + ' / ' + fmt(body?.torsoYaw);
@@ -571,6 +583,15 @@ function applyFace(result) {
     const down = Math.max(0, (shapes['eyeLookDown' + side] ?? 0) - (neutral['eyeLookDown' + side] ?? 0));
     const raw = (shapes['eyeBlink' + side] ?? 0) - base - BLINK_LOOKDOWN * down;
     setExpr('blink' + other(side), blinkRanges[side].level(raw), 1, 0.5);
+  }
+
+  // Зрачки: поворот взгляда по числам трекера
+  if (vrm.lookAt) {
+    const g = (n) => (shapes[n] ?? 0) - (neutral[n] ?? 0);
+    const yaw = (g('eyeLookOutLeft') - g('eyeLookInLeft') + g('eyeLookInRight') - g('eyeLookOutRight')) / 2;
+    const pitch = (g('eyeLookUpLeft') + g('eyeLookUpRight') - g('eyeLookDownLeft') - g('eyeLookDownRight')) / 2;
+    vrm.lookAt.yaw = smooth('gazeYaw', yaw * GAZE.yaw, t);
+    vrm.lookAt.pitch = smooth('gazePitch', pitch * GAZE.pitch, t);
   }
 
   // Рот и улыбка
@@ -602,7 +623,7 @@ function track() {
   if (!(faceTracker && video.readyState >= 2 && video.currentTime !== lastVideoTime)) return;
   lastVideoTime = video.currentTime;
 
-  if (bodyOn && poseTracker) updatePose();   // тело первым: плечи и корпус свежие
+  if (bodyOn && (poseTracker || handTracker)) updatePose();   // тело первым: плечи и корпус свежие
   const result = faceTracker.detectForVideo(video, performance.now());
   if (vrm && result.faceBlendshapes.length) {
     lastFaceTime = performance.now();
