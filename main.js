@@ -524,6 +524,9 @@ function applyArm({ side, upper, lower, ids: [s, e, w] }) {
 
 // Пальцы: сгиб каждого сустава равен углу между соседними отрезками пальца
 
+const va = new THREE.Vector3(), vb = new THREE.Vector3();
+const seg = (lm, p, k, v) => v.set(lm[p[k + 1]].x - lm[p[k]].x, lm[p[k + 1]].y - lm[p[k]].y, lm[p[k + 1]].z - lm[p[k]].z);
+
 let fist = false, fingerCurl;
 addEventListener('keydown', (e) => { if (e.code === 'KeyF') fist = !fist; });
 
@@ -636,34 +639,30 @@ function track() {
 
 function animate() {
   requestAnimationFrame(animate);
-  const delta = clock.getDelta();
-
   try {
     track();
-  } catch (e) {   // ошибка трекинга не должна останавливать модель
+    if (vrm) {
+      const faceLost = faceTracker && performance.now() - lastFaceTime > LOST_DELAY;
+      if (faceLost) {
+        headTarget.yaw = headTarget.pitch = headTarget.roll = 0;
+        lastHeadZ = undefined;
+      }
+
+      // Порядок важен: сначала туловище, потом то, что к нему прикреплено
+      updateTorsoTarget();
+      applyTorso();
+      SIDES.forEach(applyShoulder);
+      applyHead(faceLost ? LOST_SMOOTH : HEAD_SMOOTH);
+      SIDES.forEach(applyArm);
+      [['Left', 1], ['Right', -1]].forEach(applyHand);
+    }
+  } catch (e) {   // ошибка не должна замораживать модель
     if (!errorShown) {
-      console.error('Ошибка трекинга:', e);
+      console.error('Ошибка:', e);
       errorShown = true;
     }
   }
-
-  if (vrm) {
-    const faceLost = faceTracker && performance.now() - lastFaceTime > LOST_DELAY;
-    if (faceLost) {
-      headTarget.yaw = headTarget.pitch = headTarget.roll = 0;
-      lastHeadZ = undefined;
-    }
-
-    // Порядок важен: сначала туловище, потом то, что к нему прикреплено
-    updateTorsoTarget();
-    applyTorso();
-    SIDES.forEach(applyShoulder);
-    applyHead(faceLost ? LOST_SMOOTH : HEAD_SMOOTH);
-    SIDES.forEach(applyArm);
-    [['Left', 1], ['Right', -1]].forEach(applyHand);
-
-    vrm.update(delta);
-  }
+  vrm?.update(clock.getDelta());
   renderer.render(scene, camera);
 }
 animate();
