@@ -457,9 +457,6 @@ function updatePose() {
   const r = poseTracker?.detectForVideo(video, now);
   const h = handTracker?.detectForVideo(video, now);
 
-  hands = {};
-  h?.worldLandmarks.forEach((lm, i) => { hands[h.handedness[i][0].categoryName] = lm; });
-
   if (r?.landmarks.length && r.worldLandmarks.length) {
     pose = { image: r.landmarks[0], world: r.worldLandmarks[0] };
     for (const i of [11, 12, 13, 14, 15, 16]) for (const a of 'xyz') pose.world[i][a] = smooth(i + a, pose.world[i][a], t);
@@ -468,6 +465,18 @@ function updatePose() {
   } else {
     pose = body = null;
   }
+
+  // Сторона руки: по ближайшему запястью из позы, а если позы нет, по метке трекера
+  hands = {};
+  h?.worldLandmarks.forEach((lm, i) => {
+    let name = h.handedness[i][0].categoryName;
+    if (pose) {
+      const w = h.landmarks[i][0];
+      const dist = (j) => Math.hypot(w.x - pose.image[j].x, w.y - pose.image[j].y);
+      name = dist(16) < dist(15) ? 'Left' : 'Right';   // запястье 16 управляет левой рукой модели
+    }
+    hands[name] = lm;
+  });
 }
 
 // Корпус: наклон вперёд и назад от расстояния до камеры, вбок и поворот от линии плеч
