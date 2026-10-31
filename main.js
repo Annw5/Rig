@@ -523,15 +523,17 @@ function applyArm({ side, upper, lower, ids: [s, e, w] }) {
 }
 
 // Пальцы: сгиб каждого сустава равен углу между соседними отрезками пальца
-const va = new THREE.Vector3(), vb = new THREE.Vector3();
-const seg = (lm, p, k, v) => v.set(lm[p[k + 1]].x - lm[p[k]].x, lm[p[k + 1]].y - lm[p[k]].y, lm[p[k + 1]].z - lm[p[k]].z);
+
+let fist = false, fingerCurl;
+addEventListener('keydown', (e) => { if (e.code === 'KeyF') fist = !fist; });
 
 function applyHand([name, side]) {
   const lm = hands[name], flip = vrm.meta.metaVersion === '0' ? -1 : 1;
   for (const [finger, start, parts] of FINGERS) {
     const p = [0, start, start + 1, start + 2, start + 3];
     parts.forEach((part, j) => {
-      const curl = lm ? Math.min(seg(lm, p, j, va).angleTo(seg(lm, p, j + 1, vb)), FINGER_MAX) : 0.15;
+      const curl = fist ? 1.2 : lm ? Math.min(seg(lm, p, j, va).angleTo(seg(lm, p, j + 1, vb)), FINGER_MAX) : 0.15;
+      if (finger === 'Index' && j === 0 && (lm || fist)) fingerCurl = curl;
       bone(name.toLowerCase() + finger + part)?.quaternion.slerp(rot(0, 0, -side * flip * curl), FINGER_SMOOTH);
     });
   }
@@ -572,6 +574,7 @@ function applyFace(result) {
       '\nдистанция: ' + fmt(shapes.headZ) + ' см' +
       '\nтело: ' + (body ? 'видно' : 'не видно') +
       '\nкисти: ' + (handTracker ? Object.keys(hands).join(' ') || 'не вижу' : 'трекер не запущен') +
+      '\nсгиб указательного: ' + fmt(fingerCurl) + (fist ? ' (тест F)' : '') +
       '\nплечи зазор L/R: ' + fmt(body?.gapLeft) + ' / ' + fmt(body?.gapRight) +
       ' (покой ' + fmt(neutral.gapLeft) + ' / ' + fmt(neutral.gapRight) + ')' +
       '\nкорпус наклон/поворот: ' + fmt(body?.torsoRoll) + ' / ' + fmt(body?.torsoYaw);
