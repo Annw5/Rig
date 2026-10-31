@@ -541,6 +541,32 @@ const seg = (lm, p, k, v) => v.set(lm[p[k + 1]].x - lm[p[k]].x, lm[p[k + 1]].y -
 let fist = false, fingerCurl;
 addEventListener('keydown', (e) => { if (e.code === 'KeyF') fist = !fist; });
 
+// Кисть: ориентация ладони по точкам запястья, указательного и мизинца
+const handF = new THREE.Vector3(), handS = new THREE.Vector3(), handN = new THREE.Vector3();
+const restF = new THREE.Vector3(), restS = new THREE.Vector3(), restN = new THREE.Vector3();
+const basisA = new THREE.Matrix4(), basisB = new THREE.Matrix4(), handQ = new THREE.Quaternion();
+const NO_ROT = new THREE.Quaternion();
+
+function applyWrist([name, side]) {
+  const node = bone(name.toLowerCase() + 'Hand'), lm = hands[name];
+  if (!lm) return node?.quaternion.slerp(NO_ROT, ARM_SMOOTH);   // нет кисти: следует за предплечьем
+
+  setDirection(lm[0], lm[9], handF).normalize();      // вдоль ладони
+  setDirection(lm[17], lm[5], handS);                 // поперёк ладони (в сторону большого пальца)
+  handN.crossVectors(handF, handS).normalize();
+  handS.crossVectors(handN, handF);
+
+  // Покой в T-позе: пальцы вдоль руки, большой палец вперёд
+  restF.set(side, 0, 0);
+  restS.set(0, 0, 1);
+  restN.crossVectors(restF, restS);
+
+  basisA.makeBasis(handF, handS, handN);
+  basisB.makeBasis(restF, restS, restN).invert();
+  handQ.setFromRotationMatrix(basisA.multiply(basisB));
+  steer(node, handQ, ARM_SMOOTH);
+}
+
 function applyHand([name, side]) {
   const lm = hands[name], flip = vrm.meta.metaVersion === '0' ? -1 : 1;
   for (const [finger, start, parts] of FINGERS) {
@@ -668,7 +694,7 @@ function animate() {
       SIDES.forEach(applyShoulder);
       applyHead(faceLost ? LOST_SMOOTH : HEAD_SMOOTH);
       SIDES.forEach(applyArm);
-      [['Left', 1], ['Right', -1]].forEach(applyHand);
+      [['Left', 1], ['Right', -1]].forEach((s) => { applyWrist(s); applyHand(s); });
     }
   } catch (e) {   // ошибка не должна замораживать модель
     if (!errorShown) {
