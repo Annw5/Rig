@@ -22,6 +22,8 @@ const POS_SMOOTH = 0.15;
 const ARM_SIGN = { x: -1, y: -1, z: -1 };
 const ARM_REST_OUT = 0.25, ARM_SMOOTH = 0.3, VISIBLE = 0.5, POSE_EVERY = 2;
 const FINGER_SMOOTH = 0.5, FINGER_MAX = 1.6;
+// Большой палец гнётся вокруг Y (к ладони) и немного вокруг Z. Гнётся не туда: смени знак
+const THUMB = { y: 1, z: 0.4 };
 
 const SHOULDER_SIGN = 1, SHOULDER_GAIN = 5, SHOULDER_DEAD = 0.01, SHOULDER_MAX = 0.7, SHOULDER_SMOOTH = 0.3;
 
@@ -537,7 +539,10 @@ function applyHand([name, side]) {
     parts.forEach((part, j) => {
       const curl = fist ? 1.2 : lm ? Math.min(seg(lm, p, j, va).angleTo(seg(lm, p, j + 1, vb)), FINGER_MAX) : 0.15;
       if (finger === 'Index' && j === 0 && (lm || fist)) fingerCurl = curl;
-      bone(name.toLowerCase() + finger + part)?.quaternion.slerp(rot(0, 0, -side * flip * curl), FINGER_SMOOTH);
+      const q = finger === 'Thumb'
+        ? rot(0, side * THUMB.y * curl, -side * flip * THUMB.z * curl)
+        : rot(0, 0, -side * flip * curl);
+      bone(name.toLowerCase() + finger + part)?.quaternion.slerp(q, FINGER_SMOOTH);
     });
   }
 }
