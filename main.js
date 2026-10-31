@@ -21,9 +21,12 @@ const POS_SMOOTH = 0.15;
 
 const ARM_SIGN = { x: -1, y: -1, z: -1 };
 const ARM_REST_OUT = 0.25, ARM_SMOOTH = 0.3, VISIBLE = 0.5, POSE_EVERY = 2;
-const FINGER_SMOOTH = 0.5, FINGER_MAX = 1.6;
-// Большой палец гнётся вокруг Y (к ладони) и немного вокруг Z. Гнётся не туда: смени знак
-const THUMB = { y: 1, z: 0.4 };
+const TWIST_SHARE = 0.5;   // какая доля скручивания кисти уходит в предплечье (0 = всё в запястье, 1 = всё в предплечье)
+
+const FINGER_SMOOTH = 0.5, FINGER_MAX = 1.6, FINGER_DEAD = 0.1, SPREAD_MAX = 0.4;
+// Большой палец: гнётся вокруг Y (к ладони) и немного вокруг Z. Гнётся не туда: смени знак.
+// rest: изгиб, который есть даже в раскрытой ладони (по суставам), он вычитается. Палец не раскрывается: увеличь
+const THUMB = { y: 1, z: 0.4, rest: [0.6, 0.2, 0.1] };
 
 const SHOULDER_SIGN = 1, SHOULDER_GAIN = 5, SHOULDER_DEAD = 0.01, SHOULDER_MAX = 0.7, SHOULDER_SMOOTH = 0.3;
 
@@ -45,7 +48,7 @@ const BODY_KEYS = ['headX', 'headY', 'headZ', 'gapLeft', 'gapRight', 'torsoRoll'
 // ======================= ПОМОЩНИКИ =======================
 const $ = (id) => document.getElementById(id);
 const clamp01 = (v) => Math.min(1, Math.max(0, v));
-const limit = (v, max) => Math.max(-max, Math.min(max, v));
+const limit = (v, max, min = -max) => Math.max(min, Math.min(max, v));
 const dead = (v, d) => (Math.abs(v) <= d ? 0 : v - Math.sign(v) * d);
 const fmt = (v) => (v === undefined ? '-' : v.toFixed(2));
 const vis = (p) => (p?.visibility ?? 0) > VISIBLE;
@@ -113,8 +116,10 @@ const video = $('video'), cameraButton = $('cameraButton'), calibrateButton = $(
 const resetButton = $('resetButton'), bgButton = $('bgButton'), bodyButton = $('bodyButton');
 const debugBox = $('debug'), exprBox = $('exprBox'), panel = $('panel');
 
+let fist = false, fingerCurl;   // F: тест кулака
 addEventListener('keydown', (e) => {
   if (e.code === 'KeyH') panel.hidden = !panel.hidden;
+  if (e.code === 'KeyF') fist = !fist;
 });
 
 const BGS = {
@@ -425,12 +430,13 @@ function applyBodyPosition(shapes) {
   vrm.scene.position.lerp(posTarget, POS_SMOOTH);
 }
 
-// ======================= ТЕЛО: ПОЗА, ПЛЕЧИ, КОРПУС, РУКИ, ПАЛЬЦЫ =======================
+// ======================= ТЕЛО: ПОЗА, ПЛЕЧИ, КОРПУС =======================
 // Зеркало: левая сторона модели повторяет правую сторону человека
 const SIDES = [
-  { side: 1, shoulder: 'leftShoulder', upper: 'leftUpperArm', lower: 'leftLowerArm', ids: [12, 14, 16], gap: 'gapRight' },
-  { side: -1, shoulder: 'rightShoulder', upper: 'rightUpperArm', lower: 'rightLowerArm', ids: [11, 13, 15], gap: 'gapLeft' }
+  { name: 'Left', side: 1, ids: [12, 14, 16], gap: 'gapRight' },
+  { name: 'Right', side: -1, ids: [11, 13, 15], gap: 'gapLeft' }
 ];
+const part = ({ name }, bonePart) => bone(name.toLowerCase() + bonePart);
 
 // Зазор плечо-ухо (для плеч) и углы линии плеч (для корпуса)
 function readBody() {
@@ -498,17 +504,19 @@ function applyTorso() {
   });
 }
 
-function applyShoulder({ side, shoulder, gap }) {
+function applyShoulder(s) {
   let angle = 0;
-  if (body && body[gap] !== undefined) {
-    angle = limit(dead(neutral[gap] - body[gap], SHOULDER_DEAD) * SHOULDER_GAIN, SHOULDER_MAX);
+  if (body && body[s.gap] !== undefined) {
+    angle = limit(dead(neutral[s.gap] - body[s.gap], SHOULDER_DEAD) * SHOULDER_GAIN, SHOULDER_MAX);
   }
-  steer(bone(shoulder), rot(0, 0, side * angle * SHOULDER_SIGN), SHOULDER_SMOOTH);
+  steer(part(s, 'Shoulder'), rot(0, 0, s.side * angle * SHOULDER_SIGN), SHOULDER_SMOOTH);
 }
 
-const armRest = new THREE.Vector3(), armWant = new THREE.Vector3();
-const dirUpper = new THREE.Vector3(), dirLower = new THREE.Vector3();
-const upperQ = new THREE.Quaternion(), lowerQ = new THREE.Quaternion();
+// ======================= РУКА И ЗАПЯСТЬЕ =======================
+const V = () => new THREE.Vector3(), Q = () => new THREE.Quaternion(), M = () => new THREE.Matrix4();
+const armRest = V(), armWant = V(), dirUpper = V(), dirLower = V();
+const upperQ = Q(), lowerQ = Q(), handQ = Q(), relQ = Q(), twistQ = Q(), IDENTITY = Q();
+const handF = V(), handS = V(), restF = V(), restS = V(), basisN = V(), matA = M(), matB = M();
 
 const setDirection = (a, b, out) =>
   out.set((b.x - a.x) * ARM_SIGN.x, (b.y - a.y) * ARM_SIGN.y, (b.z - a.z) * ARM_SIGN.z);
@@ -518,66 +526,73 @@ function dirToQuat(side, dir, out) {
   return out.setFromUnitVectors(armRest.set(side, 0, 0), armWant.copy(dir).normalize());
 }
 
-function applyArm({ side, upper, lower, ids: [s, e, w] }) {
+// Матрица осей из направления «вдоль ладони» f и «поперёк» s (s после вызова строго перпендикулярен f)
+function basis(f, s, m) {
+  f.normalize();
+  basisN.crossVectors(f, s).normalize();
+  s.crossVectors(basisN, f);
+  return m.makeBasis(f, s, basisN);
+}
+
+// Ориентация ладони: от запястья к среднему пальцу и от мизинца к указательному.
+// Покой (T-поза): пальцы вдоль руки, большой палец вперёд
+function wristQuat(lm, side, out) {
+  basis(setDirection(lm[0], lm[9], handF), setDirection(lm[17], lm[5], handS), matA);
+  basis(restF.set(side, 0, 0), restS.set(0, 0, 1), matB);
+  return out.setFromRotationMatrix(matA.multiply(matB.invert()));
+}
+
+function applyArm(s) {
+  const { side, ids: [sh, el, wr] } = s, lm = hands[s.name];
   let upperOk = false, lowerOk = false;
   if (pose) {
     const img = pose.image, wd = pose.world;
-    upperOk = vis(img[s]) && vis(img[e]);
-    lowerOk = upperOk && vis(img[w]);
-    if (upperOk) setDirection(wd[s], wd[e], dirUpper);
-    if (lowerOk) setDirection(wd[e], wd[w], dirLower);
+    upperOk = vis(img[sh]) && vis(img[el]);
+    lowerOk = upperOk && vis(img[wr]);
+    if (upperOk) setDirection(wd[sh], wd[el], dirUpper);
+    if (lowerOk) setDirection(wd[el], wd[wr], dirLower);
   }
   if (!upperOk) dirUpper.set(side * ARM_REST_OUT, -1, 0);   // спокойная поза: руки вниз
   if (!lowerOk) dirLower.copy(dirUpper);
-  steer(bone(upper), dirToQuat(side, dirUpper, upperQ), ARM_SMOOTH);
-  steer(bone(lower), dirToQuat(side, dirLower, lowerQ), ARM_SMOOTH);
+  dirToQuat(side, dirUpper, upperQ);
+  dirToQuat(side, dirLower, lowerQ);
+
+  let wristTarget = lowerQ;   // нет кисти: ладонь просто следует за предплечьем
+  if (lm) {
+    wristTarget = wristQuat(lm, side, handQ);
+    // Скручивание кисти вокруг оси предплечья делим между предплечьем и запястьем, чтобы запястье не перекручивалось
+    relQ.copy(lowerQ).invert().multiply(handQ);
+    twistQ.set(relQ.x, 0, 0, relQ.w).normalize().slerp(IDENTITY, 1 - TWIST_SHARE);
+    lowerQ.multiply(twistQ);
+  }
+  steer(part(s, 'UpperArm'), upperQ, ARM_SMOOTH);
+  steer(part(s, 'LowerArm'), lowerQ, ARM_SMOOTH);
+  steer(part(s, 'Hand'), wristTarget, ARM_SMOOTH);
 }
 
-// Пальцы: сгиб каждого сустава равен углу между соседними отрезками пальца
+// ======================= ПАЛЬЦЫ =======================
+// Сгиб сустава = угол между соседними отрезками пальца. Разведение пальцев считается в системе координат ладони
+const va = V(), vb = V();
+const seg = (lm, p, k, v) => setDirection(lm[p[k]], lm[p[k + 1]], v);
+const spreadAngle = (v) => Math.atan2(v.dot(handS), v.dot(handF));
 
-const va = new THREE.Vector3(), vb = new THREE.Vector3();
-const seg = (lm, p, k, v) => v.set(lm[p[k + 1]].x - lm[p[k]].x, lm[p[k + 1]].y - lm[p[k]].y, lm[p[k + 1]].z - lm[p[k]].z);
-
-let fist = false, fingerCurl;
-addEventListener('keydown', (e) => { if (e.code === 'KeyF') fist = !fist; });
-
-// Кисть: ориентация ладони по точкам запястья, указательного и мизинца
-const handF = new THREE.Vector3(), handS = new THREE.Vector3(), handN = new THREE.Vector3();
-const restF = new THREE.Vector3(), restS = new THREE.Vector3(), restN = new THREE.Vector3();
-const basisA = new THREE.Matrix4(), basisB = new THREE.Matrix4(), handQ = new THREE.Quaternion();
-const NO_ROT = new THREE.Quaternion();
-
-function applyWrist([name, side]) {
-  const node = bone(name.toLowerCase() + 'Hand'), lm = hands[name];
-  if (!lm) return node?.quaternion.slerp(NO_ROT, ARM_SMOOTH);   // нет кисти: следует за предплечьем
-
-  setDirection(lm[0], lm[9], handF).normalize();      // вдоль ладони
-  setDirection(lm[17], lm[5], handS);                 // поперёк ладони (в сторону большого пальца)
-  handN.crossVectors(handF, handS).normalize();
-  handS.crossVectors(handN, handF);
-
-  // Покой в T-позе: пальцы вдоль руки, большой палец вперёд
-  restF.set(side, 0, 0);
-  restS.set(0, 0, 1);
-  restN.crossVectors(restF, restS);
-
-  basisA.makeBasis(handF, handS, handN);
-  basisB.makeBasis(restF, restS, restN).invert();
-  handQ.setFromRotationMatrix(basisA.multiply(basisB));
-  steer(node, handQ, ARM_SMOOTH);
-}
-
-function applyHand([name, side]) {
-  const lm = hands[name], flip = vrm.meta.metaVersion === '0' ? -1 : 1;
+function applyFingers(s) {
+  const { side } = s, lm = hands[s.name], flip = vrm.meta.metaVersion === '0' ? -1 : 1;
   for (const [finger, start, parts] of FINGERS) {
-    const p = [0, start, start + 1, start + 2, start + 3];
-    parts.forEach((part, j) => {
-      const curl = fist ? 1.2 : lm ? Math.min(seg(lm, p, j, va).angleTo(seg(lm, p, j + 1, vb)), FINGER_MAX) : 0.15;
-      if (finger === 'Index' && j === 0 && (lm || fist)) fingerCurl = curl;
-      const q = finger === 'Thumb'
+    const thumb = finger === 'Thumb', p = [0, start, start + 1, start + 2, start + 3];
+    parts.forEach((jointName, j) => {
+      let curl = fist ? 1.2 : 0.15, spread = 0;
+      if (lm && !fist) {
+        seg(lm, p, j, va);
+        seg(lm, p, j + 1, vb);
+        curl = limit(va.angleTo(vb) - (thumb ? THUMB.rest[j] : FINGER_DEAD), FINGER_MAX, 0);
+        if (!thumb && j === 0) spread = limit(spreadAngle(vb) - spreadAngle(va), SPREAD_MAX);
+      }
+      if (finger === 'Index' && j === 0) fingerCurl = curl;
+      const q = thumb
         ? rot(0, side * THUMB.y * curl, -side * flip * THUMB.z * curl)
-        : rot(0, 0, -side * flip * curl);
-      bone(name.toLowerCase() + finger + part)?.quaternion.slerp(q, FINGER_SMOOTH);
+        : rot(0, -side * spread, -side * flip * curl);
+      bone(s.name.toLowerCase() + finger + jointName)?.quaternion.slerp(q, FINGER_SMOOTH);
     });
   }
 }
@@ -694,7 +709,7 @@ function animate() {
       SIDES.forEach(applyShoulder);
       applyHead(faceLost ? LOST_SMOOTH : HEAD_SMOOTH);
       SIDES.forEach(applyArm);
-      [['Left', 1], ['Right', -1]].forEach((s) => { applyWrist(s); applyHand(s); });
+      SIDES.forEach(applyFingers);   // после рук: нужна система координат ладони
     }
   } catch (e) {   // ошибка не должна замораживать модель
     if (!errorShown) {
